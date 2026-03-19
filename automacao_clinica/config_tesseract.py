@@ -1,4 +1,2 @@
-# Gerado automaticamente por setup_tesseract.py
-# Não edite manualmente.
-import pytesseract
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+# Gerado automaticamente pelo setup_tesseract.py
+# Este arquivo sera criado na maquina do usuario.

@@ -1,12 +1,13 @@
 {
   "smtp": {},
-  "drive_raiz": "I:/Meu Drive/NOVAMEDICINA.2/2026",
-  "pasta_destino": "C:/Users/Kauan/Desktop/Teste/Maio",
+  "drive_raiz": "",
+  "pasta_destino": "",
   "threshold_fuzzy": 80,
+  "filtrar_aso": false,
   "enviar_email_auto": false,
   "email_relatorio": "",
-  "modo_extracao": "ocr",
+  "modo_extracao": "auto",
   "dpi_ocr": 150,
-  "max_workers": 1,
-  "filtrar_aso": true
+  "max_workers": 4,
+  "varredura_total": false
 }

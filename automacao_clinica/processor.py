@@ -1,19 +1,25 @@
 """
 processor.py — Lógica de busca e extração de documentos PDF.
-Versão final corrigida — compatível com app.py (interface Streamlit).
 
-Correções aplicadas sobre o doc1 (versão quebrada):
-  1. montar_caminho_pasta + autodetectar_meses restaurados do doc2
-     (doc1 montava drive/janeiro/15; drive real usa 1.JANEIRO 2025/15.01)
-  2. processar_lista: assinatura do callback corrigida para 4 args
-     cb(prog, etapa, detalhe, status) — igual ao que o app.py espera
-  3. Parâmetros modo_extracao, dpi_ocr, max_workers restaurados
-     (app.py passa esses parâmetros; doc1 não os aceitava → TypeError)
-  4. validar_planilha restaurada (app.py importa e chama essa função)
-  5. filtrar_aso REMOVIDO de processar_lista
-     (doc2 não tem; app.py novo não passa; era exclusividade do doc1)
-  6. Cache OCR persistente mantido (melhoria de performance do doc2)
-  7. Worker paralelo mantido (melhoria de performance do doc2)
+MELHORIAS desta versão:
+  1. CAMINHOS INTELIGENTES:
+     - Se o usuário já aponta para a pasta correta (ex: pasta do dia),
+       o sistema detecta e usa ela diretamente sem tentar montar sub-caminhos.
+     - Autodetecção de estrutura: drive/mês/dia, drive/dia, drive direto.
+     - Sem duplicação de caminho no log.
+     - Suporte a data somente com ano ou sem data (modo varredura).
+
+  2. MODO VARREDURA TOTAL (novo):
+     - Ativado quando a planilha tem só nome (sem data) ou o usuário marca
+       "Buscar em todos os PDFs".
+     - Varre TODOS os PDFs recursivamente a partir do drive_raiz.
+     - Força DPI 100 automaticamente para agilizar.
+     - Avisa o usuário que será lento antes de iniciar.
+
+  3. DETECÇÃO DE NÍVEL DO CAMINHO:
+     - Detecta automaticamente se o drive_raiz já é a pasta final,
+       uma pasta de mês ou a raiz do drive.
+     - Não monta sub-caminho se o destino já está resolvido.
 """
 
 import fitz
@@ -30,8 +36,6 @@ from pathlib import Path
 from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# Imports opcionais — carregados UMA VEZ no nível do módulo.
-# Evita overhead de 'from rapidfuzz import fuzz' dentro de loops de milhares de páginas.
 try:
     from rapidfuzz import fuzz as _fuzz
     _RAPIDFUZZ_OK = True
@@ -177,7 +181,7 @@ def abrir_seletor_pasta(titulo: str = "Selecionar pasta") -> str:
 # ---------------------------------------------------------------------------
 
 _PALAVRAS_NOME  = {"nome", "paciente", "patient", "name", "beneficiario", "segurado", "cliente", "pessoa", "titular"}
-_PALAVRAS_DATA  = {"data", "date", "dt", "dia", "procedimento", "proc", "atendimento", "consulta", "exame", "realizacao", "competencia"}
+_PALAVRAS_DATA  = {"data", "date", "dt", "dia", "procedimento", "proc", "atendimento", "consulta", "exame", "realizacao", "competencia", "ano"}
 _PALAVRAS_EMAIL = {"email", "e-mail", "correio", "mail"}
 _PALAVRAS_LIXO  = {"total", "subtotal", "soma", "media", "count", "grand total", "totais", "#", "n/a", "n.a."}
 
@@ -192,7 +196,12 @@ def _parece_data(valor) -> bool:
     if isinstance(valor, (datetime, date)):
         return True
     s = str(valor).strip()
-    padroes = [r"^\d{1,2}/\d{1,2}(/\d{2,4})?$", r"^\d{4}-\d{2}-\d{2}", r"^\d{1,2}-\d{1,2}-\d{2,4}$"]
+    padroes = [
+        r"^\d{1,2}/\d{1,2}(/\d{2,4})?$",
+        r"^\d{4}-\d{2}-\d{2}",
+        r"^\d{1,2}-\d{1,2}-\d{2,4}$",
+        r"^\d{4}$",   # só ano
+    ]
     return any(re.match(p, s) for p in padroes)
 
 def _parece_email(valor) -> bool:
@@ -316,9 +325,10 @@ def ler_planilha(caminho_excel: str) -> list[dict]:
 
 
 def validar_planilha(registros: list[dict]) -> list[dict]:
-    """Detecta duplicatas (mesmo nome + mesma data) e outros avisos."""
+    """Detecta duplicatas, datas ausentes e outros avisos."""
     avisos = []
     vistos: dict[tuple, int] = {}
+    sem_data = 0
     for i, reg in enumerate(registros, 1):
         nome = reg.get("nome", "").strip()
         data = str(reg.get("data", "")).strip()
@@ -333,29 +343,83 @@ def validar_planilha(registros: list[dict]) -> list[dict]:
         else:
             vistos[chave] = i
         if not data or data in ("None", ""):
-            avisos.append({"tipo": "data_invalida",
-                           "msg": f"Data ausente na linha {i} ({nome})", "linha": i})
+            sem_data += 1
+    if sem_data > 0:
+        avisos.append({"tipo": "sem_data",
+                       "msg": f"{sem_data} registro(s) sem data — será usado modo varredura total.",
+                       "linha": 0})
     return avisos
 
 
 # ---------------------------------------------------------------------------
-# Navegação e Caminhos
+# Navegação e Caminhos — VERSÃO INTELIGENTE
 # ---------------------------------------------------------------------------
 
-def extrair_dia_mes(data) -> tuple[str, str]:
+def extrair_componentes_data(data) -> dict:
+    """
+    Extrai dia, mês e ano de qualquer formato de data.
+    Retorna dict com chaves: dia, mes, ano, tem_dia, tem_mes, tem_ano.
+    """
+    resultado = {"dia": None, "mes": None, "ano": None,
+                 "tem_dia": False, "tem_mes": False, "tem_ano": False}
+
+    if data is None or str(data).strip() in ("", "None"):
+        return resultado
+
     if isinstance(data, (datetime, date)):
-        return data.strftime("%d"), data.strftime("%m")
+        resultado.update({
+            "dia": data.strftime("%d"), "mes": data.strftime("%m"),
+            "ano": str(data.year),
+            "tem_dia": True, "tem_mes": True, "tem_ano": True,
+        })
+        return resultado
+
     texto = str(data).strip()
-    if re.match(r"^\d{4}-\d{2}-\d{2}", texto):
-        p = texto.split("-")
-        return p[2][:2], p[1][:2]
-    if "/" in texto:
-        p = texto.split("/")
-        return p[0].strip().zfill(2), p[1].strip().zfill(2)
-    return "01", "01"
+
+    # Só ano: "2025" ou "2024"
+    if re.match(r"^\d{4}$", texto):
+        resultado.update({"ano": texto, "tem_ano": True})
+        return resultado
+
+    # DD/MM/YYYY ou DD/MM/YY ou DD/MM
+    m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?$", texto)
+    if m:
+        resultado.update({
+            "dia": m.group(1).zfill(2), "mes": m.group(2).zfill(2),
+            "tem_dia": True, "tem_mes": True,
+        })
+        if m.group(3):
+            ano = m.group(3)
+            resultado["ano"] = "20" + ano if len(ano) == 2 else ano
+            resultado["tem_ano"] = True
+        return resultado
+
+    # YYYY-MM-DD
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})", texto)
+    if m:
+        resultado.update({
+            "dia": m.group(3), "mes": m.group(2), "ano": m.group(1),
+            "tem_dia": True, "tem_mes": True, "tem_ano": True,
+        })
+        return resultado
+
+    # MM/YYYY ou MM-YYYY (sem dia)
+    m = re.match(r"^(\d{1,2})[/-](\d{4})$", texto)
+    if m:
+        resultado.update({
+            "mes": m.group(1).zfill(2), "ano": m.group(2),
+            "tem_mes": True, "tem_ano": True,
+        })
+        return resultado
+
+    # Fallback: só ano se vier algo tipo "2025-..."
+    m = re.match(r"^(\d{4})", texto)
+    if m:
+        resultado.update({"ano": m.group(1), "tem_ano": True})
+    return resultado
 
 
-# Nomes padrão das pastas de mês (usados como fallback se autodetecção falhar)
+# Mapa de nomes padrão de mês
 MESES = {
     "01": "1.JANEIRO",  "02": "2.FEVEREIRO", "03": "3.MARCO",
     "04": "4.ABRIL",    "05": "5.MAIO",       "06": "6.JUNHO",
@@ -382,12 +446,7 @@ _CACHE_MESES: dict[str, dict[str, str]] = {}
 
 
 def autodetectar_meses(drive_raiz: str) -> dict[str, str]:
-    """
-    Detecta automaticamente os nomes reais das pastas de mês no drive.
-    Ex: encontra '1.JANEIRO 2025', '2.FEVEREIRO 2025' etc. e mapeia para
-    o número do mês ('01', '02'...).
-    Cache por sessão para não varrer o disco a cada chamada.
-    """
+    """Detecta nomes reais das pastas de mês no drive. Cache por sessão."""
     if drive_raiz in _CACHE_MESES:
         return _CACHE_MESES[drive_raiz]
 
@@ -406,7 +465,6 @@ def autodetectar_meses(drive_raiz: str) -> dict[str, str]:
                 if existente is None:
                     mapa[num] = pasta.name
                 else:
-                    # Prefere a pasta com mais arquivos (mais provável ser a correta)
                     try:
                         if len(list((raiz / pasta.name).iterdir())) > len(list((raiz / existente).iterdir())):
                             mapa[num] = pasta.name
@@ -418,32 +476,152 @@ def autodetectar_meses(drive_raiz: str) -> dict[str, str]:
     return mapa
 
 
+def _detectar_nivel_pasta(pasta: Path) -> str:
+    """
+    Detecta o nível da pasta informada pelo usuário:
+      'dia'  — já contém PDFs diretamente (pasta final)
+      'mes'  — contém subpastas de dia
+      'raiz' — contém subpastas de mês
+      'vazio'— não existe ou vazia
+    """
+    if not pasta.exists():
+        return "vazio"
+    subpastas = [p for p in pasta.iterdir() if p.is_dir()]
+    pdfs_diretos = list(pasta.glob("*.pdf"))
+
+    if pdfs_diretos:
+        return "dia"
+
+    # Verifica se subpastas parecem dias (ex: "15.01", "02.03")
+    padroes_dia = [re.match(r"^\d{1,2}[.\-]\d{2}$", p.name) for p in subpastas]
+    if any(padroes_dia):
+        return "mes"
+
+    # Verifica se subpastas parecem meses
+    for p in subpastas:
+        nome_lower = normalizar_texto(p.name)
+        if any(palavra in nome_lower for palavra in _NOMES_MESES_PT):
+            return "raiz"
+
+    # Se tem subpastas mas não identificou — trata como raiz
+    if subpastas:
+        return "raiz"
+
+    return "vazio"
+
+
+def resolver_pasta_pdfs(drive_raiz: str, data) -> tuple[Path, str]:
+    """
+    Resolve o caminho final onde estão os PDFs, dado o drive_raiz e a data.
+
+    Lógica inteligente em cascata:
+      1. Se drive_raiz já contém PDFs → usa direto (usuário apontou para pasta final)
+      2. Se drive_raiz é pasta de mês → monta pasta/DD.MM
+      3. Se drive_raiz é raiz do drive → monta pasta/MÊS/DD.MM (comportamento original)
+      4. Se data é só ano → retorna pasta do ano se encontrar, ou drive_raiz
+      5. Se sem data → retorna drive_raiz (será usado varredura)
+
+    Retorna (Path resolvido, descrição do que foi feito para o log).
+    """
+    raiz = Path(drive_raiz)
+    nivel = _detectar_nivel_pasta(raiz)
+    comp  = extrair_componentes_data(data)
+
+    # ── Caso 1: pasta já tem PDFs — usa direto ──────────────────
+    if nivel == "dia":
+        return raiz, f"pasta direta (PDFs encontrados em {raiz.name})"
+
+    # ── Sem data ou só sem componentes úteis — varredura ────────
+    if not comp["tem_dia"] and not comp["tem_mes"] and not comp["tem_ano"]:
+        return raiz, "sem data — varredura"
+
+    # ── Caso: só ano informado ───────────────────────────────────
+    if comp["tem_ano"] and not comp["tem_mes"]:
+        # Procura pasta com o ano no nome dentro do drive_raiz
+        ano = comp["ano"]
+        for p in raiz.iterdir() if raiz.exists() else []:
+            if p.is_dir() and ano in p.name:
+                return p, f"pasta do ano {ano} detectada: {p.name}"
+        return raiz, f"ano {ano} — varredura na raiz"
+
+    # ── Caso: tem mês mas não tem dia ────────────────────────────
+    if comp["tem_mes"] and not comp["tem_dia"]:
+        mes_num = comp["mes"]
+        if nivel == "raiz":
+            mapa = autodetectar_meses(drive_raiz)
+            nome_mes = mapa.get(mes_num, MESES.get(mes_num, mes_num))
+            pasta_mes = raiz / nome_mes
+            return pasta_mes, f"pasta do mês: {nome_mes}"
+        # Se nível for mes, já está na pasta certa
+        return raiz, f"pasta do mês (já apontada)"
+
+    # ── Caso principal: tem dia e mês ────────────────────────────
+    dia    = comp["dia"]
+    mes    = comp["mes"]
+    pasta_dia_nome = f"{dia}.{mes}"
+
+    if nivel == "dia":
+        # Já está na pasta certa — não adiciona sub-caminho
+        return raiz, f"pasta direta usada: {raiz.name}"
+
+    if nivel == "mes":
+        # drive_raiz é pasta de mês — só adiciona o dia
+        pasta_final = raiz / pasta_dia_nome
+        return pasta_final, f"pasta do mês/{pasta_dia_nome}"
+
+    if nivel == "raiz":
+        # drive_raiz é raiz — monta mês + dia
+        mapa = autodetectar_meses(drive_raiz)
+        nome_mes = mapa.get(mes, MESES.get(mes, mes))
+        pasta_final = raiz / nome_mes / pasta_dia_nome
+        return pasta_final, f"{nome_mes}/{pasta_dia_nome}"
+
+    # fallback
+    return raiz / pasta_dia_nome, pasta_dia_nome
+
+
+# Mantém compatibilidade com o app.py que chama montar_caminho_pasta
 def montar_caminho_pasta(drive_raiz: str, data) -> Path:
-    """
-    Constrói o caminho da pasta do dia no drive.
-    Usa autodetecção dos nomes reais das pastas de mês.
-    Formato da pasta do dia: DD.MM (ex: 15.01)
-    """
-    dia, mes_num = extrair_dia_mes(data)
+    pasta, _ = resolver_pasta_pdfs(drive_raiz, data)
+    return pasta
 
+
+# ---------------------------------------------------------------------------
+# Detecção de modo de busca por registro
+# ---------------------------------------------------------------------------
+
+def classificar_modo_registro(data) -> str:
+    """
+    Classifica o modo de busca para um registro:
+      'dia'      — tem dia+mês (pode ir direto para a pasta)
+      'mes'      — tem só mês (busca na pasta do mês inteiro)
+      'ano'      — tem só ano (busca na pasta do ano)
+      'varredura'— sem data (busca em tudo)
+    """
+    comp = extrair_componentes_data(data)
+    if comp["tem_dia"] and comp["tem_mes"]:
+        return "dia"
+    if comp["tem_mes"]:
+        return "mes"
+    if comp["tem_ano"]:
+        return "ano"
+    return "varredura"
+
+
+def coletar_pdfs_recursivo(pasta_raiz: Path, limite: int = 5000) -> list[Path]:
+    """
+    Coleta todos os PDFs recursivamente a partir de pasta_raiz.
+    Limite de segurança para não travar em drives enormes.
+    """
+    pdfs = []
     try:
-        if isinstance(data, (datetime, date)):
-            ano = str(data.year)
-        else:
-            texto = str(data).strip()
-            m = re.match(r"^(\d{4})", texto)
-            ano = m.group(1) if m else Path(drive_raiz).name
+        for pdf in sorted(pasta_raiz.rglob("*.pdf")):
+            pdfs.append(pdf)
+            if len(pdfs) >= limite:
+                break
     except Exception:
-        ano = Path(drive_raiz).name
-
-    pasta_dia = f"{dia}.{mes_num}"
-
-    mapa = autodetectar_meses(drive_raiz)
-    if mes_num in mapa:
-        return Path(drive_raiz) / mapa[mes_num] / pasta_dia
-
-    nome_mes = MESES.get(mes_num, mes_num)
-    return Path(drive_raiz) / f"{nome_mes} {ano}" / pasta_dia
+        pass
+    return pdfs
 
 
 # ---------------------------------------------------------------------------
@@ -516,89 +694,49 @@ MODO_OCR    = "ocr"
 
 
 # ---------------------------------------------------------------------------
-# Filtro ASO (Atestado de Saúde Ocupacional)
+# Filtro ASO
 # ---------------------------------------------------------------------------
 
-# Marcadores que IDENTIFICAM um ASO legítimo (precisa ter ao menos _ASO_SCORE_MINIMO)
 _ASO_MARCADORES_INCLUSAO = {
-    "aso",
-    "atestado de saude ocupacional",
-    "admissional",
-    "demissional",
-    "retorno ao trabalho",
-    "mudanca de riscos ocupacionais",
-    "periodico",
-    "nr-7",
-    "pcmso",
-    "exame clinico",
-    "riscos",
-    "inapto",
-    "apto",
+    "aso", "atestado de saude ocupacional", "admissional", "demissional",
+    "retorno ao trabalho", "mudanca de riscos ocupacionais", "periodico",
+    "nr-7", "pcmso", "exame clinico", "riscos", "inapto", "apto",
     "medico responsavel",
 }
 
-# Marcadores que EXCLUEM a página — ela não é um ASO mesmo que tenha o nome
 _ASO_MARCADORES_EXCLUSAO = {
-    "prontuario de pericia medica",
-    "prontuario",
-    "pericia medica",
-    "cid:",
-    "dias de afastamento",
-    "data do atestado",
-    "afastamento total",
-    "afastamento parcial",
-    "receita medica",
-    "prescricao medica",
-    "atestado medico",
-    "laudo medico",
+    "prontuario de pericia medica", "prontuario", "pericia medica",
+    "cid:", "dias de afastamento", "data do atestado",
+    "afastamento total", "afastamento parcial", "receita medica",
+    "prescricao medica", "atestado medico", "laudo medico",
     "relatorio medico",
 }
 
-# Pontuação mínima de marcadores de inclusão para aceitar a página como ASO
 _ASO_SCORE_MINIMO = 2
 
-
 def _pagina_e_aso(texto: str) -> bool:
-    """
-    Verifica se uma página é um ASO (Atestado de Saúde Ocupacional).
-
-    Lógica:
-      1. Normaliza o texto (remove acentos, minúsculas)
-      2. Verifica se algum marcador de EXCLUSÃO está presente → não é ASO
-      3. Conta marcadores de INCLUSÃO presentes
-      4. É ASO se score >= _ASO_SCORE_MINIMO e nenhuma exclusão
-
-    Retorna True se a página é ASO, False caso contrário.
-    """
     texto_norm = normalizar_texto(texto)
-
-    # Exclusões têm prioridade (mais rápido e mais seguro)
     for excluir in _ASO_MARCADORES_EXCLUSAO:
         if excluir in texto_norm:
             return False
-
     score = sum(1 for inc in _ASO_MARCADORES_INCLUSAO if inc in texto_norm)
     return score >= _ASO_SCORE_MINIMO
 
 
+# ---------------------------------------------------------------------------
+# Extração de texto por página
+# ---------------------------------------------------------------------------
+
 def extrair_texto_pagina(pagina: fitz.Page, forcar_ocr: bool = False, dpi: int = 150) -> str:
-    """
-    Extrai texto de uma página PDF.
-    - forcar_ocr=False: retorna texto nativo (get_text). Se vazio, tenta OCR.
-    - forcar_ocr=True : pula get_text e vai direto ao OCR.
-    PIL e pytesseract são usados das variáveis de módulo (_PILImage, _pytesseract)
-    para evitar import a cada chamada.
-    """
     if not forcar_ocr:
         texto = pagina.get_text()
         if len(texto.strip()) >= 50:
             return texto
-        # Texto nativo insuficiente — cai no OCR abaixo
     else:
         texto = ""
 
     if not _OCR_OK:
-        return texto  # OCR não disponível, retorna o que tiver
+        return texto
 
     try:
         _, lang = _get_tess_config()
@@ -609,80 +747,6 @@ def extrair_texto_pagina(pagina: fitz.Page, forcar_ocr: bool = False, dpi: int =
     except Exception as e:
         print(f"[OCR] Erro na página: {e}", file=sys.stderr)
         return texto
-
-
-def buscar_nome_em_pdf(
-    caminho_pdf: Path,
-    nome_buscado: str,
-    threshold: float = 80.0,
-    callback_pagina=None,
-    modo: str = MODO_AUTO,
-    dpi: int = 150,
-    filtrar_aso: bool = False,
-) -> list[tuple[int, float]]:
-    """
-    Busca o nome em todas as páginas do PDF. Retorna lista de (num_pagina, score).
-
-    Parâmetro filtrar_aso:
-        Se True, ignora páginas que não sejam ASO (Atestado de Saúde Ocupacional).
-        Prontuários, atestados médicos comuns, receitas etc. são pulados mesmo
-        que contenham o nome do paciente.
-        Default: False (busca em qualquer tipo de documento).
-    """
-    encontradas = []
-    doc = fitz.open(str(caminho_pdf))
-    total_pags = len(doc)
-
-    for num, pagina in enumerate(doc):
-
-        if modo == MODO_NATIVO:
-            if callback_pagina:
-                callback_pagina(num, total_pags, "texto nativo")
-            texto = extrair_texto_pagina(pagina, forcar_ocr=False, dpi=dpi)
-            if filtrar_aso and not _pagina_e_aso(texto):
-                continue
-            achou, score = nome_contem(texto, nome_buscado, threshold)
-
-        elif modo == MODO_OCR:
-            if callback_pagina:
-                callback_pagina(num, total_pags, "pré-filtro")
-            texto_rapido = pagina.get_text()
-            achou_rapido, score_rapido = nome_contem(texto_rapido, nome_buscado, threshold)
-            if achou_rapido:
-                achou, score = achou_rapido, score_rapido
-            else:
-                if callback_pagina:
-                    callback_pagina(num, total_pags, "OCR")
-                texto = extrair_texto_pagina(pagina, forcar_ocr=True, dpi=dpi)
-                if filtrar_aso and not _pagina_e_aso(texto):
-                    continue
-                achou, score = nome_contem(texto, nome_buscado, threshold)
-
-        else:  # AUTO
-            if callback_pagina:
-                callback_pagina(num, total_pags, "texto nativo")
-            texto = extrair_texto_pagina(pagina, forcar_ocr=False, dpi=dpi)
-            achou, score = nome_contem(texto, nome_buscado, threshold)
-
-            if not achou or score < threshold:
-                if callback_pagina:
-                    callback_pagina(num, total_pags, "OCR")
-                texto_ocr = extrair_texto_pagina(pagina, forcar_ocr=True, dpi=dpi)
-                achou_p, score_p = nome_contem(texto_ocr, nome_buscado, threshold)
-                if score_p > score:
-                    achou, score = achou_p, score_p
-                    texto = texto_ocr  # usa o texto mais rico para checar ASO
-
-            if filtrar_aso and not _pagina_e_aso(texto):
-                continue
-
-        if achou:
-            encontradas.append((num, score))
-            if score >= threshold:
-                break  # score suficiente — para de varrer o PDF
-
-    doc.close()
-    return encontradas
 
 
 def sanitizar_nome_arquivo(nome: str) -> str:
@@ -700,7 +764,6 @@ def extrair_e_salvar_paginas(
     pasta_destino.mkdir(parents=True, exist_ok=True)
     nome_base = sanitizar_nome_arquivo(nome_paciente)
     saida = pasta_destino / f"{nome_base}.pdf"
-    # Evita sobrescrever se já existir
     contador = 2
     while saida.exists():
         saida = pasta_destino / f"{nome_base}_{contador}.pdf"
@@ -716,16 +779,10 @@ def extrair_e_salvar_paginas(
 
 
 # ---------------------------------------------------------------------------
-# Worker de PDF — função de MÓDULO (fora de qualquer loop)
-# Sem closure, sem captura de variável de loop — seguro para ThreadPoolExecutor
+# Worker de PDF
 # ---------------------------------------------------------------------------
 
 def _pdf_e_digital(doc: fitz.Document, amostras: int = 5) -> bool:
-    """
-    Verifica rapidamente se um PDF é digital (texto nativo) ou escaneado.
-    Amostra até `amostras` páginas distribuídas pelo documento.
-    Custo: apenas get_text() em poucas páginas, sem nenhum OCR.
-    """
     total = len(doc)
     if total == 0:
         return False
@@ -744,22 +801,7 @@ def _worker_pdf(
     n_pdfs: int,
     filtrar_aso: bool = False,
 ) -> tuple[int, Path, dict[str, tuple[list, float, int]], list[str]]:
-    """
-    Processa um PDF em thread secundária.
-    NÃO chama callback diretamente (Streamlit proíbe acesso à UI de threads).
-    Retorna (j, pdf, resultados, logs).
-
-    Otimizações:
-      - Detecção antecipada de PDF digital vs escaneado no modo AUTO
-        (amostra 5 páginas e decide o modo uma vez, evita tentativa nativa
-        inútil em cada página de um PDF escaneado)
-      - Early-exit por página: para de processar o PDF assim que todos
-        os nomes buscados já foram encontrados com score >= threshold
-      - get_text() direto no modo nativo (sem passar por extrair_texto_pagina)
-      - Imports PIL/pytesseract/rapidfuzz resolvidos no nível do módulo
-    """
     logs: list[str] = []
-
     cache = _cache_load(pdf)
     dirty = False
     textos: dict[int, str] = {}
@@ -772,8 +814,6 @@ def _worker_pdf(
         return j, pdf, {}, logs
 
     total_pags = len(doc)
-
-    # Detecção antecipada: no modo AUTO, decide uma vez se o PDF é digital ou scan
     modo_efetivo = modo
     if modo == MODO_AUTO:
         eh_digital = _pdf_e_digital(doc)
@@ -783,17 +823,13 @@ def _worker_pdf(
             f" → modo {modo_efetivo}  {pdf.name}"
         )
 
-    # Conjunto de nomes ainda não encontrados com score suficiente
-    # Usado para early-exit: quando vazio, para o loop de páginas
     nomes_pendentes = set(nomes)
 
     for num, pagina in enumerate(doc):
-
-        # Early-exit: todos os nomes já achados com score suficiente
         if not nomes_pendentes:
             logs.append(
-                f"PDF {j+1}/{n_pdfs}  early-exit na pág {num+1} "
-                f"(todos os nomes encontrados)  {pdf.name}"
+                f"PDF {j+1}/{n_pdfs}  early-exit pág {num+1} "
+                f"(todos encontrados)  {pdf.name}"
             )
             break
 
@@ -803,11 +839,10 @@ def _worker_pdf(
             texto = cache[chave]
             logs.append(f"PDF {j+1}/{n_pdfs}  pág {num+1}/{total_pags} (cache)  {pdf.name}")
         else:
-            # Extração conforme modo efetivo — sem get_text() redundante
             if modo_efetivo == MODO_NATIVO:
                 logs.append(f"PDF {j+1}/{n_pdfs}  pág {num+1}/{total_pags} (nativo)  {pdf.name}")
                 texto = pagina.get_text()
-            else:  # MODO_OCR
+            else:
                 logs.append(f"PDF {j+1}/{n_pdfs}  pág {num+1}/{total_pags} (OCR)  {pdf.name}")
                 texto = extrair_texto_pagina(pagina, forcar_ocr=True, dpi=dpi)
 
@@ -815,12 +850,10 @@ def _worker_pdf(
                 cache[chave] = texto
                 dirty = True
 
-        # Classifica a página (ASO ou descartada)
         if filtrar_aso and not _pagina_e_aso(texto):
             textos_descartados[num] = texto
         else:
             textos[num] = texto
-            # Atualiza early-exit: remove nomes já encontrados com score suficiente
             for nome in list(nomes_pendentes):
                 achou, score = nome_contem(texto, nome, threshold)
                 if achou and score >= threshold:
@@ -831,7 +864,6 @@ def _worker_pdf(
     if dirty:
         _cache_save(pdf, cache)
 
-    # Varredura final — coleta todas as páginas com match para cada nome
     resultados: dict[str, tuple[list, float, int]] = {}
     for nome in nomes:
         encontradas: list[tuple[int, float]] = []
@@ -860,9 +892,6 @@ def _worker_pdf(
     logs.append(f"PDF {j+1}/{n_pdfs} concluído  {pdf.name}")
     return j, pdf, resultados, logs
 
-    logs.append(f"PDF {j+1}/{n_pdfs} concluído  {pdf.name}")
-    return j, pdf, resultados, logs
-
 
 # ---------------------------------------------------------------------------
 # Função Principal
@@ -878,31 +907,20 @@ def processar_lista(
     dpi_ocr: int = 150,
     max_workers: int = 4,
     filtrar_aso: bool = False,
+    varredura_total: bool = False,
 ) -> list[dict]:
     """
     Processa todos os registros da planilha.
 
-    Parâmetros:
-        caminho_excel   : caminho para o .xlsx
-        drive_raiz      : raiz do drive com as pastas dos meses
-        pasta_destino   : onde salvar os PDFs extraídos
-        threshold_fuzzy : pontuação mínima para busca fuzzy (0-100)
-        callback        : função(prog: float, etapa: str, detalhe: str, status: str)
-                          status: "info" | "ok" | "erro" | "aviso" | "pdf_salvo"
-        modo_extracao   : MODO_AUTO | MODO_NATIVO | MODO_OCR
-        dpi_ocr         : resolução para OCR (150 / 200 / 300)
-        max_workers     : threads paralelas para PDFs
-        filtrar_aso     : se True, só extrai páginas que sejam ASO.
-                          Ignora prontuários, atestados médicos comuns, receitas etc.
-                          Default: False (extrai qualquer página com o nome)
-
-    Retorna lista de dicts: nome, data, email, encontrado, arquivo, erro, score_fuzzy
+    Parâmetro varredura_total:
+        Se True, ignora as datas e varre TODOS os PDFs recursivamente
+        a partir do drive_raiz. Útil quando só se tem o nome.
+        DPI é forçado para 100 automaticamente para agilizar.
     """
     def _cb(prog: float, etapa: str, detalhe: str = "", status: str = "info"):
         if callback:
             callback(prog, etapa, detalhe, status)
 
-    # Limpa cache de detecção de meses para garantir leitura fresca do drive
     _CACHE_MESES.clear()
 
     _cb(0.0, "Lendo planilha", "Aguarde...")
@@ -910,29 +928,48 @@ def processar_lista(
     total = len(registros)
     _cb(0.0, "Planilha lida", f"{total} registros encontrados", "ok")
 
-    # Agrupa registros por pasta (mesma data = mesma pasta = mesmo grupo)
+    # ── Detecta se precisa de varredura total ────────────────────
+    sem_data = sum(1 for r in registros
+                   if not r.get("data") or str(r["data"]).strip() in ("", "None"))
+    modo_varredura = varredura_total or (sem_data == total)
+
+    if modo_varredura:
+        dpi_ocr = 100  # força DPI baixo para agilizar
+        _cb(0.0, "Modo varredura total ativado",
+            f"DPI forçado para 100 — buscando em todos os PDFs de {drive_raiz}", "aviso")
+
+    # ── Agrupa registros por pasta resolvida ─────────────────────
     grupos: dict[str, list[dict]] = {}
+
     for reg in registros:
-        try:
-            chave = str(montar_caminho_pasta(drive_raiz, reg["data"]))
-        except Exception:
-            chave = "__erro__"
+        if modo_varredura:
+            chave = drive_raiz
+        else:
+            modo_reg = classificar_modo_registro(reg.get("data"))
+            if modo_reg == "varredura":
+                chave = drive_raiz
+            else:
+                try:
+                    pasta_resolvida, descricao = resolver_pasta_pdfs(drive_raiz, reg["data"])
+                    chave = str(pasta_resolvida)
+                except Exception:
+                    chave = "__erro__"
         grupos.setdefault(chave, []).append(reg)
 
     n_grupos = len(grupos)
     _cb(0.0, "Agrupamento concluído",
         f"{n_grupos} pasta(s) distintas para {total} registro(s)", "ok")
 
-    # Mapa de resultados indexado por nome
+    # Mapa de resultados
     resultados_map: dict[str, dict] = {}
     for reg in registros:
         resultados_map[reg["nome"]] = {
-            "nome": reg["nome"], "data": str(reg["data"]),
+            "nome": reg["nome"], "data": str(reg.get("data", "")),
             "email": reg.get("email", ""),
             "encontrado": False, "arquivo": "", "erro": "", "score_fuzzy": 0.0,
         }
 
-    # Retomada automática: pula nomes cujo PDF já existe no destino
+    # Retomada automática
     destino_path = Path(pasta_destino)
     pulados = 0
     for reg in registros:
@@ -955,7 +992,6 @@ def processar_lista(
         prog_base = (grupos_feitos - 1) / n_grupos
         prog_fim  = grupos_feitos       / n_grupos
 
-        # Remove nomes já encontrados (retomada)
         regs_grupo  = [r for r in regs_grupo_orig
                        if not resultados_map[r["nome"]]["encontrado"]]
         nomes_grupo = [r["nome"] for r in regs_grupo]
@@ -972,35 +1008,49 @@ def processar_lista(
             continue
 
         pasta = Path(chave)
+
+        # ── Descrição limpa para o log (sem duplicar o drive_raiz) ──
+        try:
+            descricao_pasta = pasta.relative_to(drive_raiz).as_posix()
+        except ValueError:
+            descricao_pasta = pasta.name
+
         _cb(prog_base, "Verificando pasta",
-            f"{pasta.name}  —  {n_nomes} paciente(s)")
+            f"{descricao_pasta}  —  {n_nomes} paciente(s)")
 
         if not pasta.exists():
             for r in regs_grupo:
-                resultados_map[r["nome"]]["erro"] = f"Pasta não encontrada: {pasta}"
-            _cb(prog_fim, "Pasta não encontrada", str(pasta), "erro")
+                resultados_map[r["nome"]]["erro"] = (
+                    f"Pasta não encontrada: {descricao_pasta}"
+                )
+            _cb(prog_fim, "Pasta não encontrada", descricao_pasta, "erro")
             continue
 
-        pdfs   = sorted(pasta.glob("*.pdf"))
+        # ── Coleta PDFs ──────────────────────────────────────────
+        if modo_varredura or chave == drive_raiz:
+            pdfs = coletar_pdfs_recursivo(pasta)
+            _cb(prog_base, "Varredura recursiva",
+                f"{len(pdfs)} PDF(s) encontrados em {descricao_pasta}", "info")
+        else:
+            pdfs = sorted(pasta.glob("*.pdf"))
+
         n_pdfs = len(pdfs)
 
         if n_pdfs == 0:
             for r in regs_grupo:
-                resultados_map[r["nome"]]["erro"] = "Nenhum PDF na pasta."
-            _cb(prog_fim, "Sem PDFs", str(pasta), "aviso")
+                resultados_map[r["nome"]]["erro"] = f"Nenhum PDF em: {descricao_pasta}"
+            _cb(prog_fim, "Sem PDFs", descricao_pasta, "aviso")
             continue
 
         _cb(prog_base, "Pasta localizada",
-            f"{n_pdfs} PDF(s)  —  buscando {n_nomes} nome(s) de uma vez", "ok")
+            f"{n_pdfs} PDF(s)  —  buscando {n_nomes} nome(s)", "ok")
 
-        # melhor[nome] = (pdf, [(pag, score)], score_max, n_paginas_descartadas_aso)
         melhor: dict[str, tuple] = {}
         lock   = threading.Lock()
         parar  = threading.Event()
 
         workers = min(max_workers, n_pdfs)
         with ThreadPoolExecutor(max_workers=workers) as ex:
-
             futuros = {
                 ex.submit(
                     _worker_pdf,
@@ -1027,22 +1077,20 @@ def processar_lista(
                         _tb.format_exc().strip().splitlines()[-1], "erro")
                     continue
 
-                # Exibe logs do worker na thread principal (seguro para Streamlit)
                 prog_pdf = prog_base + (prog_fim - prog_base) * ((j + 1) / n_pdfs)
                 for linha in logs:
                     _cb(prog_pdf, linha, "", "info")
 
-                # Atualiza melhor resultado por nome
                 with lock:
                     for nome, (pags, score, em_descartada) in res.items():
-                        sc_atual, desc_atual = melhor.get(nome, (None, [], 0.0, 0))[2:4]
+                        entrada_atual = melhor.get(nome, (None, [], 0.0, 0))
+                        sc_atual = entrada_atual[2]
+                        desc_atual = entrada_atual[3]
                         if score > sc_atual:
                             melhor[nome] = (pdf, pags, score, em_descartada)
                         elif em_descartada > desc_atual:
-                            # Mesmo sem melhorar score, acumula contagem de descartadas
-                            entrada = melhor.get(nome, (None, [], 0.0, 0))
-                            melhor[nome] = (entrada[0], entrada[1], entrada[2],
-                                            entrada[3] + em_descartada)
+                            melhor[nome] = (entrada_atual[0], entrada_atual[1],
+                                            entrada_atual[2], entrada_atual[3] + em_descartada)
 
                     todos_ok = all(
                         melhor.get(n, (None, [], 0.0, 0))[2] >= threshold_fuzzy
@@ -1080,11 +1128,9 @@ def processar_lista(
                     _cb(prog_fim, "Erro ao salvar", str(e), "erro")
             else:
                 if filtrar_aso and em_descartada > 0:
-                    # Nome encontrado, mas só em páginas que não são ASO
                     msg_erro = (
                         f"Nome encontrado em {em_descartada} página(s), "
-                        f"mas nenhuma delas é ASO — são prontuários ou outros documentos. "
-                        f"Desative o filtro ASO para extrair mesmo assim."
+                        f"mas nenhuma é ASO. Desative o filtro ASO para extrair."
                     )
                     resultados_map[nome]["erro"] = msg_erro
                     _cb(prog_fim, "Filtrado — não é ASO",
@@ -1093,11 +1139,11 @@ def processar_lista(
                     detalhe = f"Buscado em {n_pdfs} PDF(s)"
                     if score > 0:
                         detalhe += f" — melhor score: {score:.0f}% (threshold: {threshold_fuzzy:.0f}%)"
-                    resultados_map[nome]["erro"] = "Nome não localizado nos PDFs da pasta."
+                    resultados_map[nome]["erro"] = "Nome não localizado nos PDFs."
                     _cb(prog_fim, "Não encontrado", detalhe, "aviso")
 
         _cb(prog_fim, "Pasta concluída",
-            f"{pasta.name}  —  {enc_grupo}/{n_nomes} encontrados",
+            f"{descricao_pasta}  —  {enc_grupo}/{n_nomes} encontrados",
             "ok" if enc_grupo == n_nomes else "aviso")
 
     resultados = [resultados_map[r["nome"]] for r in registros]

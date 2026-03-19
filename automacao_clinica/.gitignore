@@ -1,0 +1,59 @@
+# ============================================================
+#  iFind Clínica — .gitignore
+# ============================================================
+
+# ── Dados pessoais e sensíveis ──────────────────────────────
+clinica.db
+config.json
+.auth_token
+.porta_local
+update.log
+
+# ── Tesseract — caminho específico da máquina ────────────────
+config_tesseract.py
+
+# ── Ambiente virtual Python ──────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Cache Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Cache OCR (arquivos grandes gerados em runtime) ──────────
+.ocr_*.json
+
+# ── Builds e releases ────────────────────────────────────────
+dist/
+dist_releases/
+*.exe
+*.zip
+*.log
+
+# ── Backups de updates ───────────────────────────────────────
+.backups/
+
+# ── Inno Setup ───────────────────────────────────────────────
+Output/
+*.~is
+
+# ── Sistema operacional ──────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDEs ─────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# ── Redistribuíveis (instaladores pesados) ───────────────────
+_redist/
+
+# ── Node ──────────────────────────────
+package-lock.json
+node_modules/

@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableDelayedExpansion
-title Buscador de Documentos - Clinica
+title iFind Clinica
 
 :: ============================================================
 ::  Pasta raiz
@@ -12,11 +12,12 @@ cd /d "%PROJETO%"
 set "STREAMLIT=%PROJETO%\.venv\Scripts\streamlit.exe"
 set "PY=%PROJETO%\.venv\Scripts\python.exe"
 set "PYPIP=%PROJETO%\.venv\Scripts\python.exe"
+set "PORTA_FILE=%PROJETO%\.porta_local"
 
 cls
 echo.
 echo  +----------------------------------------------------------+
-echo  ^|      BUSCADOR DE DOCUMENTOS - CLINICA v2                ^|
+echo  ^|      iFIND CLINICA v2                                   ^|
 echo  ^|      Sistema de busca automatica em PDFs                ^|
 echo  +----------------------------------------------------------+
 echo.
@@ -196,20 +197,63 @@ if "!TESS_OK!"=="1" (
 )
 
 :: ============================================================
-::  [6/6]  Porta
+::  [6/6]  Porta — deteccao inteligente por PC
+::
+::  Logica:
+::    1. Le a porta salva em .porta_local (especifica deste PC)
+::    2. Verifica se essa porta ainda esta livre
+::    3. Se estiver ocupada, busca a proxima livre no range 8501-8599
+::    4. Salva a porta escolhida em .porta_local para proxima vez
+::
+::  Cada PC da rede usa sua propria porta — sem conflito.
 :: ============================================================
+:STEP6
 echo  [6/6]  Porta de rede...
 
 set "PORTA=8501"
-netstat -ano 2>nul | findstr ":8501 " | findstr "LISTENING" >nul 2>&1
-if not errorlevel 1 (
-    set "PORTA=8502"
-    netstat -ano 2>nul | findstr ":8502 " | findstr "LISTENING" >nul 2>&1
-    if not errorlevel 1 ( set "PORTA=8503" )
-)
-echo         Porta !PORTA!
 
-:: Detecta IP local
+:: Tenta ler porta salva anteriormente neste PC
+if exist "%PORTA_FILE%" (
+    set /p PORTA_SALVA=<"%PORTA_FILE%"
+    :: Valida se e um numero entre 8501 e 8599
+    echo !PORTA_SALVA! | findstr /R "^85[0-9][0-9]$" >nul 2>&1
+    if not errorlevel 1 (
+        set "PORTA=!PORTA_SALVA!"
+        echo         Porta preferida deste PC: !PORTA_SALVA!
+    )
+)
+
+:: Verifica se a porta escolhida esta realmente livre
+:: Se nao estiver, busca a proxima livre no range 8501-8599
+set "TENTATIVAS=0"
+:BUSCA_PORTA
+netstat -ano 2>nul | findstr ":!PORTA! " | findstr "LISTENING" >nul 2>&1
+if not errorlevel 1 (
+    :: Porta ocupada — tenta a proxima
+    set /a PORTA+=1
+    set /a TENTATIVAS+=1
+
+    :: Nao passou de 8599
+    if !PORTA! GTR 8599 set "PORTA=8501"
+
+    :: Seguranca: nao tenta mais de 99 vezes
+    if !TENTATIVAS! LSS 99 goto :BUSCA_PORTA
+
+    :: Chegou aqui sem achar porta livre — usa 8501 mesmo
+    echo         AVISO: nenhuma porta livre encontrada no range 8501-8599.
+    echo         Tentando com 8501 assim mesmo...
+    set "PORTA=8501"
+    goto :PORTA_OK
+)
+
+:PORTA_OK
+:: Salva a porta escolhida para este PC reutilizar na proxima vez
+echo !PORTA!>"%PORTA_FILE%"
+echo         Porta escolhida: !PORTA! (salva para este PC)
+
+:: ============================================================
+::  Detecta IP local para acesso pela rede
+:: ============================================================
 set "IP_LOCAL=seu-ip"
 for /f "tokens=2 delims=:" %%I in ('ipconfig 2^>nul ^| findstr "IPv4"') do (
     set "IP_TMP=%%I"
@@ -229,8 +273,8 @@ echo.
 echo  +----------------------------------------------------------+
 echo  ^|  Tudo pronto. Abrindo o sistema...                      ^|
 echo  ^|                                                          ^|
-echo  ^|  Acesso local  : http://localhost:!PORTA!                    ^|
-echo  ^|  Acesso na rede: http://!IP_LOCAL!:!PORTA!
+echo  ^|  Acesso local  : http://localhost:!PORTA!                ^|
+echo  ^|  Acesso na rede: http://!IP_LOCAL!:!PORTA!               ^|
 echo  ^|                                                          ^|
 echo  ^|  Login padrao  : admin / admin123                        ^|
 echo  ^|  Para encerrar : feche esta janela ou Ctrl+C             ^|
