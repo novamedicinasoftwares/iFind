@@ -4,7 +4,7 @@
 ; ================================================================
 
 #define AppName      "iFind Clinica"
-#define AppVersion   "2.0"
+#define AppVersion   "1.0.0"
 #define AppPublisher "iFind"
 #define AppExeName   "iFind Clinica.exe"
 #define AppId        "{{B3C4D5E6-F7A8-9012-BCDE-F12345678901}}"
@@ -20,7 +20,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={localappdata}\iFind Clinica
 DefaultGroupName={#AppName}
 OutputDir=dist
-OutputBaseFilename=ifind_clinica_v2_setup
+OutputBaseFilename=ifind_clinica_v1_setup
 SetupIconFile=ifind.ico
 UninstallDisplayIcon={app}\ifind.ico
 UninstallDisplayName={#AppName}
@@ -54,6 +54,8 @@ Source: "auth.py";                DestDir: "{app}"; Flags: ignoreversion
 Source: "database.py";            DestDir: "{app}"; Flags: ignoreversion
 Source: "processor.py";           DestDir: "{app}"; Flags: ignoreversion
 Source: "mailer.py";              DestDir: "{app}"; Flags: ignoreversion
+Source: "updater.py";             DestDir: "{app}"; Flags: ignoreversion
+Source: "gerar_release.py";       DestDir: "{app}"; Flags: ignoreversion
 Source: "setup_tesseract.py";     DestDir: "{app}"; Flags: ignoreversion
 Source: "requirements.txt";       DestDir: "{app}"; Flags: ignoreversion
 Source: "iniciar.bat";            DestDir: "{app}"; Flags: ignoreversion
@@ -85,7 +87,6 @@ Type: files;          Name: "{app}\.auth_token"
 
 [Code]
 
-// ── Verifica se Python 3.9+ esta no PATH ──────────────────────
 function PythonOk(): Boolean;
 var
   RC: Integer;
@@ -97,7 +98,6 @@ begin
   ) and (RC = 0);
 end;
 
-// ── Baixa arquivo via PowerShell (funciona em todo Windows 10/11) ─
 function BaixarArquivo(Url, Destino: String): Boolean;
 var
   RC: Integer;
@@ -110,12 +110,6 @@ begin
             and (RC = 0);
 end;
 
-// ── Instala Python 3.11 silenciosamente ───────────────────────
-// Flags oficiais do instalador Python:
-//   InstallAllUsers=0  -> instala so para o usuario atual (sem admin)
-//   PrependPath=1      -> adiciona ao PATH automaticamente
-//   Include_pip=1      -> garante pip instalado
-//   SimpleInstall=1    -> sem dialogo
 function InstalarPython(): Boolean;
 var
   TempDir, PythonInstaller: String;
@@ -126,7 +120,6 @@ begin
   TempDir := ExpandConstant('{tmp}');
   PythonInstaller := TempDir + '\{#PythonExe}';
 
-  // Tela de progresso
   WizardForm.StatusLabel.Caption := 'Baixando Python 3.11...';
   WizardForm.ProgressGauge.Style := npbstMarquee;
 
@@ -145,14 +138,12 @@ begin
 
   WizardForm.StatusLabel.Caption := 'Instalando Python 3.11...';
 
-  // Instala para o usuario atual sem precisar de admin
   Result := Exec(
     PythonInstaller,
     '/quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 SimpleInstall=1',
     '', SW_HIDE, ewWaitUntilTerminated, RC
   ) and (RC = 0);
 
-  // Remove o instalador temporario
   DeleteFile(PythonInstaller);
 
   if not Result then
@@ -167,7 +158,6 @@ begin
   end;
 end;
 
-// ── Cria o launcher .cs ───────────────────────────────────────
 procedure SalvarArquivoCS(CsSrc: String);
 var
   C: String;
@@ -206,7 +196,6 @@ begin
   SaveStringToFile(CsSrc, C, False);
 end;
 
-// ── Cria o script PowerShell que compila o .cs ───────────────
 procedure SalvarScriptPS(ScriptPS, CsSrc, ExeDst, IcoPath: String);
 var
   PS: String;
@@ -275,18 +264,15 @@ begin
   end;
 end;
 
-// ── Roda antes de tudo: verifica/instala Python automaticamente ─
 function InitializeSetup(): Boolean;
 var
   Msg: String;
 begin
   Result := True;
 
-  // Python ja esta ok — nao faz nada
   if PythonOk() then
     Exit;
 
-  // Python nao encontrado — instala automaticamente
   Msg := 'Python nao foi encontrado neste computador.';
   Msg := Msg + #13#10;
   Msg := Msg + #13#10;
@@ -301,17 +287,12 @@ begin
 
   if not InstalarPython() then
   begin
-    // Instalacao falhou — aborta
     Result := False;
     Exit;
   end;
 
-  // Verifica se o Python esta acessivel apos instalacao
   if not PythonOk() then
   begin
-    // PATH ainda nao foi atualizado nesta sessao — normal no Windows
-    // O iniciar.bat usa "python" que ja estara no PATH na proxima sessao
-    // Avisamos o usuario mas deixamos continuar
     Msg := 'Python instalado com sucesso!';
     Msg := Msg + #13#10;
     Msg := Msg + #13#10;
