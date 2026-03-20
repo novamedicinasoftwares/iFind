@@ -1,11 +1,12 @@
 {
-  "version": "1.0.0",
-  "url": "https://github.com/MedOcup-Systems/iFind/releases/download/v1.0/ifind_v1.0.zip",
-  "hash_sha256": "7a32a621d378a0059efcd9acd7d7d63af725486ebdf6f7eba2ee7c7c0c9c7a38",
-  "notas": "Publicação da primeira versão do sistema",
+  "version": "1.0.1",
+  "url": "https://github.com/novamedicinasoftwares/iFind/releases/download/v1.0.1/ifind_v1.0.1.zip",
+  "hash_sha256": "ff4b6bf5a23992c38bd8912be0a17d8bfc61b97f86df4f48898c5bb532da5aed",
+  "notas": "Busca individual por nome, correcao numpy Python 3.13",
   "obrigatorio": false,
-  "gerado_em": "2026-03-19 15:19:57",
+  "gerado_em": "2026-03-20 14:36:58",
   "arquivos": [
+    "launcher.py",
     "app.py",
     "auth.py",
     "database.py",
@@ -15,7 +16,7 @@
     "updater.py",
     "requirements.txt",
     "iniciar.bat",
-    "README.md",
+    "ifind.ico",
     ".streamlit/config.toml"
   ]
 }

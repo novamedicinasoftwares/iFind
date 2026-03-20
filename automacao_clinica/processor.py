@@ -1150,3 +1150,195 @@ def processar_lista(
     enc_total  = sum(r["encontrado"] for r in resultados)
     _cb(1.0, "Concluído", f"{enc_total}/{total} encontrados", "ok")
     return resultados
+
+# PATCH para processor.py
+# ============================================================
+# INSTRUCAO: adicione este codigo NO FINAL do processor.py,
+# antes da ultima linha (se houver alguma fora das funcoes).
+# ============================================================
+
+
+
+# ---------------------------------------------------------------------------
+# Busca Individual — pesquisa por nome sem planilha
+# ---------------------------------------------------------------------------
+
+def buscar_individual(
+    nome: str,
+    drive_raiz: str,
+    pasta_destino: str,
+    data: str = "",
+    threshold_fuzzy: float = 80.0,
+    callback=None,
+    modo_extracao: str = MODO_AUTO,
+    dpi_ocr: int = 150,
+    max_workers: int = 4,
+    filtrar_aso: bool = False,
+) -> dict:
+    """
+    Busca um único paciente pelo nome nos PDFs do drive.
+
+    Muito mais simples que processar_lista() — sem planilha, sem agrupamentos.
+    Ideal para o operador que quer encontrar um documento específico rapidinho.
+
+    Parâmetros:
+        nome          : nome completo (ou parcial) do paciente
+        drive_raiz    : pasta raiz do drive com os PDFs
+        pasta_destino : onde salvar o PDF encontrado
+        data          : data no formato DD/MM, DD/MM/AAAA ou vazio para varrer tudo
+        threshold_fuzzy: sensibilidade da busca (60-100)
+        callback      : função(progresso, etapa, detalhe, status) para UI
+
+    Retorna dict com:
+        encontrado    : bool
+        nome          : str
+        data          : str
+        arquivo       : str  (caminho do PDF salvo)
+        score_fuzzy   : float
+        erro          : str  (mensagem se não encontrou)
+        pdfs_buscados : int  (quantos PDFs foram verificados)
+    """
+    def _cb(prog, etapa, detalhe="", status="info"):
+        if callback:
+            callback(prog, etapa, detalhe, status)
+
+    resultado = {
+        "encontrado"   : False,
+        "nome"         : nome.strip(),
+        "data"         : data.strip(),
+        "arquivo"      : "",
+        "score_fuzzy"  : 0.0,
+        "erro"         : "",
+        "pdfs_buscados": 0,
+    }
+
+    nome = nome.strip()
+    if not nome:
+        resultado["erro"] = "Informe o nome do paciente."
+        return resultado
+
+    _cb(0.05, "Localizando pasta...", drive_raiz)
+
+    # ── Resolve a pasta de busca ────────────────────────────────
+    data_val = data.strip() if data else None
+    modo_reg = classificar_modo_registro(data_val) if data_val else "varredura"
+
+    if modo_reg == "varredura" or not data_val:
+        pasta = Path(drive_raiz)
+        _cb(0.10, "Modo varredura", "Sem data — buscando em todos os PDFs", "aviso")
+        pdfs = coletar_pdfs_recursivo(pasta)
+    else:
+        try:
+            pasta, descricao = resolver_pasta_pdfs(drive_raiz, data_val)
+            _cb(0.10, "Pasta localizada", descricao, "ok")
+            if not pasta.exists():
+                resultado["erro"] = f"Pasta não encontrada: {pasta.name}"
+                _cb(1.0, "Pasta não encontrada", str(pasta), "erro")
+                return resultado
+            pdfs = sorted(pasta.glob("*.pdf"))
+        except Exception as e:
+            resultado["erro"] = f"Erro ao montar caminho: {e}"
+            return resultado
+
+    n_pdfs = len(pdfs)
+    resultado["pdfs_buscados"] = n_pdfs
+
+    if n_pdfs == 0:
+        resultado["erro"] = "Nenhum PDF encontrado na pasta."
+        _cb(1.0, "Sem PDFs", "Verifique o caminho do drive e a data.", "erro")
+        return resultado
+
+    _cb(0.15, "Buscando...", f"{n_pdfs} PDF(s) para verificar")
+
+    # ── Busca nos PDFs em paralelo ──────────────────────────────
+    melhor_pdf    = None
+    melhor_pags   = []
+    melhor_score  = 0.0
+    em_descartada = 0
+    workers       = min(max_workers, n_pdfs)
+
+    import threading
+    parar = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futuros = {
+            ex.submit(
+                _worker_pdf,
+                j, pdf,
+                [nome],
+                threshold_fuzzy,
+                modo_extracao,
+                dpi_ocr,
+                n_pdfs,
+                filtrar_aso,
+            ): (j, pdf)
+            for j, pdf in enumerate(pdfs)
+        }
+
+        for fut in as_completed(futuros):
+            if parar.is_set():
+                break
+            try:
+                j, pdf, res, logs = fut.result()
+            except Exception:
+                continue
+
+            prog = 0.15 + 0.75 * ((j + 1) / n_pdfs)
+            _cb(prog, f"Verificando PDF {j+1}/{n_pdfs}", pdf.name)
+
+            pags, score, desc = res.get(nome, ([], 0.0, 0))
+            if score > melhor_score:
+                melhor_score  = score
+                melhor_pdf    = pdf
+                melhor_pags   = pags
+                em_descartada = desc
+
+            # Encontrou com boa pontuação — para cedo
+            if melhor_score >= 98.0:
+                parar.set()
+                for f in futuros:
+                    f.cancel()
+                break
+
+    # ── Salva o resultado ───────────────────────────────────────
+    if melhor_pags:
+        try:
+            saida = extrair_e_salvar_paginas(
+                melhor_pdf, melhor_pags,
+                Path(pasta_destino), nome,
+            )
+            resultado.update({
+                "encontrado" : True,
+                "arquivo"    : str(saida),
+                "score_fuzzy": melhor_score,
+            })
+            _cb(1.0, "Documento encontrado!",
+                f"{nome}  —  score {melhor_score:.0f}%", "ok")
+        except Exception as e:
+            resultado["erro"] = f"Erro ao salvar PDF: {e}"
+            _cb(1.0, "Erro ao salvar", str(e), "erro")
+    else:
+        if filtrar_aso and em_descartada > 0:
+            resultado["erro"] = (
+                f"Nome encontrado em {em_descartada} página(s), "
+                "mas nenhuma é ASO. Desative o filtro ASO para extrair."
+            )
+            _cb(1.0, "Encontrado, mas não é ASO",
+                f"{em_descartada} pág(s) descartada(s) pelo filtro", "aviso")
+        elif melhor_score > 0:
+            resultado["erro"] = (
+                f"Nome encontrado com score {melhor_score:.0f}% "
+                f"(mínimo necessário: {threshold_fuzzy:.0f}%). "
+                "Tente reduzir a sensibilidade."
+            )
+            _cb(1.0, "Score insuficiente",
+                f"Melhor match: {melhor_score:.0f}% em {n_pdfs} PDF(s)", "aviso")
+        else:
+            resultado["erro"] = (
+                f"Nome não localizado em {n_pdfs} PDF(s). "
+                "Verifique a grafia ou a data informada."
+            )
+            _cb(1.0, "Não encontrado",
+                f"Buscado em {n_pdfs} PDF(s)", "aviso")
+
+    return resultado

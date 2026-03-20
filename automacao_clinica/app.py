@@ -310,7 +310,7 @@ try:
         alterar_senha, desativar_usuario,
     )
     from auth      import tela_login, usuario_atual, fazer_logout, inicializar_sessao
-    from processor import processar_lista, validar_planilha, ler_planilha
+    from processor import processar_lista, validar_planilha, ler_planilha, buscar_individual
     from mailer    import enviar_email, enviar_relatorio_execucao, email_configurado
 except ImportError as e:
     st.error(f"❌ Erro de importação: `{e}`")
@@ -557,459 +557,768 @@ def _main():
     #  ABA 1 — BUSCA
     # ════════════════════════════════════════════════════════
     with aba_busca:
-        secao_titulo("🔍", "Nova busca", "Configure os parâmetros e inicie o processamento")
+        secao_titulo("🔍", "Busca de documentos", "Encontre documentos de pacientes nos PDFs do drive")
 
-        def _cb_drive():
-            from processor import abrir_seletor_pasta
-            p = abrir_seletor_pasta("Pasta raiz do drive")
-            if p: st.session_state["input_drive_raiz"] = p
+        # ── Sub-modo: Planilha ou Individual ────────────────
+        _modo_busca = st.radio(
+            "Como você quer buscar?",
+            options=["planilha", "individual"],
+            format_func=lambda x: "📋  Vários pacientes (planilha)" if x == "planilha" else "👤  Um paciente (busca rápida)",
+            horizontal=True,
+            key="modo_busca",
+            label_visibility="collapsed",
+        )
 
-        def _cb_destino():
-            from processor import abrir_seletor_pasta
-            p = abrir_seletor_pasta("Pasta de destino")
-            if p: st.session_state["input_pasta_destino"] = p
+        st.markdown("<div style='margin-top:4px'></div>", unsafe_allow_html=True)
+        st.divider()
 
-        col1, col2 = st.columns(2, gap="medium")
+        # ────────────────────────────────────────────────────
+        # MODO INDIVIDUAL — busca rápida por nome
+        # ────────────────────────────────────────────────────
+        if _modo_busca == "individual":
+            secao_titulo("👤", "Busca rápida", "Encontre o documento de um paciente pelo nome")
 
-        # ── Coluna esquerda ──────────────────────────────────
-        with col1:
-            st.markdown("##### 📄 Planilha de pacientes")
-            arquivo_excel = st.file_uploader(
-                "Arraste ou clique para enviar",
-                type=["xlsx", "xls"],
-                help="Colunas detectadas automaticamente.",
-                label_visibility="collapsed",
-            )
+            _bi_c1, _bi_c2 = st.columns([3, 2], gap="large")
 
-            if arquivo_excel:
+            with _bi_c1:
+                st.markdown("##### Dados do paciente")
+
+                _bi_nome = st.text_input(
+                    "Nome do paciente",
+                    placeholder="Ex: João Silva Oliveira",
+                    key="bi_nome",
+                    help="Digite o nome completo ou parcial. O sistema tolera pequenas variações de grafia.",
+                )
+
+                _bi_data = st.text_input(
+                    "Data do procedimento (opcional)",
+                    placeholder="Ex: 15/03  ou  15/03/2025  ou  deixe vazio para buscar em tudo",
+                    key="bi_data",
+                    help=(
+                        "Com a data, a busca é muito mais rápida — o sistema vai direto à pasta certa.\n\n"
+                        "Sem a data, o sistema varre todos os PDFs do drive (mais lento)."
+                    ),
+                )
+
+                # Dica visual se data estiver vazia
+                if not _bi_data.strip():
+                    st.caption("💡 Sem data: a busca pode demorar mais pois verifica todos os arquivos.")
+
+                st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+                st.markdown("##### Pastas")
+
+                def _cb_drive_bi():
+                    from processor import abrir_seletor_pasta
+                    p = abrir_seletor_pasta("Pasta raiz do drive")
+                    if p: st.session_state["input_drive_raiz"] = p
+
+                def _cb_destino_bi():
+                    from processor import abrir_seletor_pasta
+                    p = abrir_seletor_pasta("Pasta de destino")
+                    if p: st.session_state["input_pasta_destino"] = p
+
+                _bid1, _bid2 = st.columns([6, 1])
+                with _bid1:
+                    _bi_drive = st.text_input(
+                        "Pasta do drive",
+                        placeholder="Ex: Z:\\Procedimentos",
+                        key="input_drive_raiz",
+                        label_visibility="collapsed" if st.session_state.get("input_drive_raiz") else "visible",
+                    )
+                with _bid2:
+                    st.markdown("<div style='margin-top:4px'></div>", unsafe_allow_html=True)
+                    st.button("🗂️", key="btn_drive_bi", help="Selecionar pelo explorador", on_click=_cb_drive_bi)
+
+                _bip1, _bip2 = st.columns([6, 1])
+                with _bip1:
+                    _bi_destino = st.text_input(
+                        "Salvar documento em",
+                        placeholder="Ex: C:\\Resultados",
+                        key="input_pasta_destino",
+                        label_visibility="collapsed" if st.session_state.get("input_pasta_destino") else "visible",
+                    )
+                with _bip2:
+                    st.markdown("<div style='margin-top:4px'></div>", unsafe_allow_html=True)
+                    st.button("🗂️", key="btn_destino_bi", help="Selecionar pelo explorador", on_click=_cb_destino_bi)
+
+            with _bi_c2:
+                st.markdown("##### Configurações")
+
+                _bi_sens = st.select_slider(
+                    "Precisão na busca do nome",
+                    options=[60, 70, 80, 90, 100],
+                    value=cfg.get("threshold_fuzzy", 80),
+                    format_func=lambda v: {
+                        60: "🟡 Ampla — aceita variações grandes",
+                        70: "🟡 Moderada — variações médias",
+                        80: "🟢 Padrão — pequenos erros",
+                        90: "🔵 Rigorosa — quase exata",
+                        100: "🔵 Exata — nome idêntico",
+                    }[v],
+                    help=(
+                        "Padrão recomendado: 80%.\n\n"
+                        "Use 60–70% se o nome está incompleto ou com erros de digitação.\n"
+                        "Use 90–100% se quer evitar resultados incorretos."
+                    ),
+                )
+
+                with st.expander("⚙️ Opções avançadas"):
+                    _bi_filtro_aso = st.checkbox(
+                        "Buscar apenas ASO",
+                        value=cfg.get("filtrar_aso", False),
+                        key="bi_filtrar_aso",
+                        help="Ignora prontuários e outros documentos — extrai só Atestados de Saúde Ocupacional.",
+                    )
+                    _bi_modo = st.radio(
+                        "Tipo de PDF",
+                        options=["auto", "nativo", "ocr"],
+                        format_func=lambda k: {
+                            "auto": "🔄 Detectar automaticamente",
+                            "nativo": "⚡ PDF digital (mais rápido)",
+                            "ocr": "🔍 PDF escaneado (mais lento)",
+                        }[k],
+                        index=["auto","nativo","ocr"].index(cfg.get("modo_extracao","auto")),
+                        key="bi_modo_extracao",
+                    )
+                    _bi_dpi = st.select_slider(
+                        "Qualidade do OCR",
+                        options=[100, 150, 200, 300],
+                        value=cfg.get("dpi_ocr", 150),
+                        format_func=lambda v: {100:"100 DPI (rápido)",150:"150 DPI (padrão)",200:"200 DPI (melhor)",300:"300 DPI (máximo)"}[v],
+                        disabled=(_bi_modo == "nativo"),
+                        key="bi_dpi",
+                    )
+
+                st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+
+            # ── Botão de busca ───────────────────────────────
+            _bi_col_btn = st.columns([1, 2, 1])[1]
+            with _bi_col_btn:
+                _bi_iniciar = st.button(
+                    "🔍  Buscar documento",
+                    type="primary",
+                    use_container_width=True,
+                    key="btn_busca_individual",
+                )
+
+            # ── Execução ─────────────────────────────────────
+            if _bi_iniciar:
+                _bi_erros = []
+                if not _bi_nome.strip():
+                    _bi_erros.append("Informe o nome do paciente.")
+                if not st.session_state.get("input_drive_raiz","").strip():
+                    _bi_erros.append("Informe a pasta do drive.")
+                if not st.session_state.get("input_pasta_destino","").strip():
+                    _bi_erros.append("Informe a pasta onde salvar o documento.")
+                if _bi_erros:
+                    for _e in _bi_erros:
+                        st.error(f"❌ {_e}")
+                    st.stop()
+
+                _bi_drive_val   = st.session_state.get("input_drive_raiz","").strip()
+                _bi_destino_val = st.session_state.get("input_pasta_destino","").strip()
+
+                st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
+
+                _bi_barra   = st.progress(0, text="Iniciando...")
+                _bi_status  = st.empty()
+                _bi_log     = st.empty()
+                _bi_log_lst = []
+
+                def _bi_cb(prog, etapa, detalhe="", status="info"):
+                    _bi_barra.progress(min(prog, 1.0), text=f"{int(prog*100)}%")
+                    _COR_BI = {
+                        "ok":    ("#065f46","#059669","#ecfdf5"),
+                        "erro":  ("#991b1b","#dc2626","#fef2f2"),
+                        "aviso": ("#92400e","#d97706","#fffbeb"),
+                        "info":  ("#1e40af","#3b82f6","#eff6ff"),
+                    }
+                    fg,ac,bg = _COR_BI.get(status, _COR_BI["info"])
+                    det = f'<div style="font-size:11px;color:{ac};margin-top:2px;">{detalhe}</div>' if detalhe else ""
+                    _bi_status.markdown(
+                        f'<div style="background:{bg};border-left:3px solid {ac};border-radius:0 10px 10px 0;padding:10px 16px;margin:4px 0;">'
+                        f'<span style="font-weight:600;color:{fg};">{etapa}</span>{det}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    linha = f"{etapa}" + (f" — {detalhe}" if detalhe else "")
+                    _bi_log_lst.append(linha)
+                    _bi_log.code("\n".join(_bi_log_lst[-8:]), language=None)
+
                 try:
-                    import tempfile as _tf
-                    with _tf.NamedTemporaryFile(delete=False, suffix=".xlsx") as _t:
-                        _t.write(arquivo_excel.read()); _tp = _t.name
-                    arquivo_excel.seek(0)
-                    _regs   = ler_planilha(_tp); os.unlink(_tp)
-                    _avisos = validar_planilha(_regs)
-
-                    # Banner de sucesso via componente nativo (sem HTML manual)
-                    st.success(f"✓ **{len(_regs)} registros detectados**")
-
-                    # Avisos só aparecem se houver
-                    for _av in _avisos[:3]:
-                        st.warning(f"⚠ {_av['msg']}")
-
-                    # Preview completo com st.dataframe nativo
-                    with st.expander("👁️ Prévia da planilha", expanded=True):
-                        _prev_df = pd.DataFrame([
-                            {
-                                "Nome":   r.get("nome", ""),
-                                "Data":   str(r.get("data", "")),
-                                "E-mail": r.get("email", "") or "—",
-                            }
-                            for r in _regs
-                        ])
-                        st.dataframe(
-                            _prev_df,
-                            use_container_width=True,
-                            hide_index=True,
-                            height=min(36 * len(_prev_df) + 38, 320),
-                        )
-                        st.caption(f"Exibindo {len(_regs)} registros")
-
+                    from processor import buscar_individual
+                    _bi_res = buscar_individual(
+                        nome          = _bi_nome.strip(),
+                        drive_raiz    = _bi_drive_val,
+                        pasta_destino = _bi_destino_val,
+                        data          = _bi_data.strip(),
+                        threshold_fuzzy = _bi_sens,
+                        callback      = _bi_cb,
+                        modo_extracao = _bi_modo,
+                        dpi_ocr       = _bi_dpi,
+                        max_workers   = cfg.get("max_workers", 4),
+                        filtrar_aso   = _bi_filtro_aso,
+                    )
                 except Exception as _ex:
-                    st.error(f"❌ Erro ao ler planilha: {_ex}")
+                    st.error(f"❌ Erro inesperado: {_ex}")
+                    st.stop()
 
-            st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
-            st.markdown("##### 📁 Caminhos")
+                _bi_barra.progress(1.0, text="Concluído!")
+                _bi_status.empty()
 
-            _c1, _c2 = st.columns([6, 1])
-            with _c1:
-                drive_raiz = st.text_input(
-                    "Pasta raiz do drive",
-                    placeholder="Ex: Z:\\Procedimentos",
-                    key="input_drive_raiz",
-                )
-            with _c2:
-                st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-                st.button("🗂️", key="btn_drive", help="Selecionar pelo explorador", on_click=_cb_drive)
+                st.markdown("<div style='margin-top:1.5rem'></div>", unsafe_allow_html=True)
 
-            _c3, _c4 = st.columns([6, 1])
-            with _c3:
-                pasta_destino = st.text_input(
-                    "Pasta de destino",
-                    placeholder="Ex: C:\\Resultados",
-                    key="input_pasta_destino",
-                )
-            with _c4:
-                st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
-                st.button("🗂️", key="btn_destino", help="Selecionar pelo explorador", on_click=_cb_destino)
+                if _bi_res["encontrado"]:
+                    # ── Card de sucesso ───────────────────────
+                    _sc = _bi_res['score_fuzzy']
+                    _sc_cor = "#059669" if _sc >= 90 else "#d97706" if _sc >= 70 else "#dc2626"
+                    st.markdown(
+                        f"""<div style="background:linear-gradient(135deg,#ecfdf5,#d1fae5);
+                            border:1.5px solid #6ee7b7;border-radius:16px;
+                            padding:24px 28px;animation:fadeUp .4s ease both;">
+                            <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+                                <div style="width:44px;height:44px;background:#1D9E75;border-radius:12px;
+                                    display:flex;align-items:center;justify-content:center;font-size:22px;">✅</div>
+                                <div>
+                                    <div style="font-size:17px;font-weight:700;color:#065f46;">Documento encontrado!</div>
+                                    <div style="font-size:12px;color:#059669;margin-top:2px;">
+                                        Correspondência de <strong>{_sc:.0f}%</strong> com o nome informado
+                                    </div>
+                                </div>
+                            </div>
+                            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+                                <div style="background:rgba(255,255,255,0.7);border-radius:10px;padding:12px;">
+                                    <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Paciente</div>
+                                    <div style="font-size:13px;font-weight:600;color:#065f46;">{_bi_res['nome']}</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.7);border-radius:10px;padding:12px;">
+                                    <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">Data</div>
+                                    <div style="font-size:13px;font-weight:600;color:#065f46;">{_bi_res['data'] or '—'}</div>
+                                </div>
+                                <div style="background:rgba(255,255,255,0.7);border-radius:10px;padding:12px;">
+                                    <div style="font-size:10px;color:#6b7280;text-transform:uppercase;letter-spacing:.5px;margin-bottom:4px;">PDFs verificados</div>
+                                    <div style="font-size:13px;font-weight:600;color:#065f46;">{_bi_res['pdfs_buscados']}</div>
+                                </div>
+                            </div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
 
-        # ── Coluna direita ───────────────────────────────────
-        with col2:
-            st.markdown("##### ⚙️ Configurações da busca")
+                    st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
 
-            threshold = st.slider(
-                "🎯 Sensibilidade fuzzy",
-                min_value=60, max_value=100,
-                value=cfg.get("threshold_fuzzy", 80), step=5,
-                help="100 = exato  |  80 = tolera erros de OCR  |  60 = permissivo",
-            )
+                    _arq_path = Path(_bi_res["arquivo"])
+                    _btn_a, _btn_b, _btn_c = st.columns(3)
 
-            _MODOS = {
-                "auto":   "🔄 Automático — detecta tipo do PDF",
-                "nativo": "⚡ Só texto nativo — PDFs digitais (rápido)",
-                "ocr":    "🔍 Só OCR — PDFs escaneados (lento)",
-            }
-            modo_extracao = st.radio(
-                "📄 Modo de extração",
-                options=list(_MODOS.keys()),
-                format_func=lambda k: _MODOS[k],
-                index=list(_MODOS.keys()).index(cfg.get("modo_extracao", "auto")),
-            )
+                    with _btn_a:
+                        if st.button("📂  Abrir pasta", use_container_width=True):
+                            try:
+                                import platform as _plt
+                                if _plt.system() == "Windows":
+                                    import subprocess
+                                    subprocess.Popen(f'explorer /select,"{_arq_path}"')
+                                elif _plt.system() == "Darwin":
+                                    import subprocess
+                                    subprocess.run(["open", "-R", str(_arq_path)])
+                                else:
+                                    import subprocess
+                                    subprocess.run(["xdg-open", str(_arq_path.parent)])
+                            except Exception as _oe:
+                                st.error(f"Não foi possível abrir: {_oe}")
 
-            _cDPI, _cWRK = st.columns(2)
-            with _cDPI:
-                dpi_ocr = st.select_slider(
-                    "🖼️ Qualidade OCR",
-                    options=[150, 200, 300],
-                    value=cfg.get("dpi_ocr", 150),
-                    format_func=lambda v: {150:"⚡ 150 DPI", 200:"⚖️ 200 DPI", 300:"🔬 300 DPI"}[v],
-                    disabled=(modo_extracao == "nativo"),
-                )
-            with _cWRK:
-                max_workers = st.slider(
-                    "🧵 Threads",
-                    min_value=1, max_value=8,
-                    value=cfg.get("max_workers", 4),
-                    help="PDFs processados em paralelo. Mais threads = mais rápido.",
-                )
+                    with _btn_b:
+                        if _arq_path.exists():
+                            with open(_arq_path, "rb") as _f:
+                                st.download_button(
+                                    "⬇️  Baixar PDF",
+                                    data=_f.read(),
+                                    file_name=_arq_path.name,
+                                    mime="application/pdf",
+                                    use_container_width=True,
+                                )
+                        else:
+                            st.warning("Arquivo não localizado.")
 
-            st.markdown("<div style='margin-top:4px'></div>", unsafe_allow_html=True)
-            _cASO, _cMAIL = st.columns(2)
-            with _cASO:
-                filtrar_aso = st.checkbox(
-                    "🏥 Apenas ASO",
-                    value=cfg.get("filtrar_aso", False),
-                    help="Ignora páginas que não sejam Atestado de Saúde Ocupacional.",
-                )
-            with _cMAIL:
-                enviar_email_auto = st.checkbox(
-                    "📧 E-mail automático",
-                    value=cfg.get("enviar_email_auto", False),
-                )
+                    with _btn_c:
+                        if st.button("🔄  Nova busca", use_container_width=True, key="bi_nova_busca"):
+                            for _k in ["bi_nome","bi_data","bi_log_lst"]:
+                                st.session_state.pop(_k, None)
+                            st.rerun()
 
-            varredura_total = st.checkbox(
-                "🔎 Varredura total (buscar em todos os PDFs)",
-                value=cfg.get("varredura_total", False),
-                help=(
-                    "Ignora as datas da planilha e varre TODOS os PDFs recursivamente "
-                    "a partir da pasta raiz.\n\n"
-                    "Use quando a planilha tem só nomes, ou quando a estrutura de pastas "
-                    "não segue o padrão mês/dia.\n\n"
-                    "⚠️ Processo lento — DPI é forçado para 100 automaticamente."
-                ),
-            )
-            if varredura_total:
-                st.warning(
-                    "⚠️ **Varredura total ativada** — todos os PDFs serão processados. "
-                    "Pode levar vários minutos dependendo do volume de arquivos."
-                )
+                else:
+                    # ── Card de não encontrado ────────────────
+                    st.markdown(
+                        f"""<div style="background:#fef2f2;border:1.5px solid #fca5a5;
+                            border-radius:16px;padding:24px 28px;animation:fadeUp .4s ease both;">
+                            <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
+                                <div style="width:44px;height:44px;background:#fee2e2;border-radius:12px;
+                                    display:flex;align-items:center;justify-content:center;font-size:22px;">❌</div>
+                                <div>
+                                    <div style="font-size:17px;font-weight:700;color:#991b1b;">Documento não encontrado</div>
+                                    <div style="font-size:12px;color:#dc2626;margin-top:2px;">{_bi_res['erro']}</div>
+                                </div>
+                            </div>
+                        </div>""",
+                        unsafe_allow_html=True,
+                    )
 
-            email_relatorio = ""
-            if enviar_email_auto:
-                email_relatorio = st.text_input(
-                    "E-mail para relatório",
-                    value=cfg.get("email_relatorio", ""),
-                    placeholder="gestor@clinica.com.br",
-                )
+                    st.markdown("<div style='margin-top:1rem'></div>", unsafe_allow_html=True)
 
-        st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
-        iniciar = st.button("▶  Iniciar busca", type="primary", use_container_width=True)
+                    with st.expander("💡 Sugestões para encontrar o documento"):
+                        st.markdown("""
+                        **Verifique:**
+                        - A grafia do nome está igual à do documento? (Ex: "José" vs "Jose")
+                        - A data está correta? Tente deixar em branco para buscar em tudo.
+                        - A pasta do drive aponta para o local certo?
 
-        # ── Processamento ────────────────────────────────────
-        if iniciar:
-            erros = []
-            if not arquivo_excel:         erros.append("Faça upload da planilha Excel.")
-            if not drive_raiz.strip():    erros.append("Informe o caminho do drive.")
-            if not pasta_destino.strip(): erros.append("Informe a pasta de destino.")
-            if erros:
-                for e in erros: st.error(f"❌ {e}")
-                st.stop()
+                        **Tente:**
+                        - Reduzir a precisão da busca para **70%** ou **60%**
+                        - Usar só parte do nome (ex: apenas o sobrenome)
+                        - Deixar a data em branco para varrer todos os PDFs
+                        """)
 
-            cfg.update({
-                "drive_raiz": drive_raiz.strip(), "pasta_destino": pasta_destino.strip(),
-                "threshold_fuzzy": threshold, "filtrar_aso": filtrar_aso,
-                "enviar_email_auto": enviar_email_auto, "email_relatorio": email_relatorio,
-                "modo_extracao": modo_extracao, "dpi_ocr": dpi_ocr, "max_workers": max_workers, "varredura_total": varredura_total,
-            })
-            salvar_config(cfg)
+        # ────────────────────────────────────────────────────
+        # MODO PLANILHA — comportamento original completo
+        # ────────────────────────────────────────────────────
+        else:
+            secao_titulo("📋", "Busca em lote", "Processe uma lista de pacientes de uma planilha Excel")
 
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-                tmp.write(arquivo_excel.read())
-                caminho_tmp = tmp.name
+            def _cb_drive():
+                from processor import abrir_seletor_pasta
+                p = abrir_seletor_pasta("Pasta raiz do drive")
+                if p: st.session_state["input_drive_raiz"] = p
 
-            execucao_id = iniciar_execucao(usuario.get("id"), drive_raiz.strip(), pasta_destino.strip())
+            def _cb_destino():
+                from processor import abrir_seletor_pasta
+                p = abrir_seletor_pasta("Pasta de destino")
+                if p: st.session_state["input_pasta_destino"] = p
 
-            st.markdown(
-                """<div style="font-size:14px;font-weight:600;color:#111827;
-                    margin:1rem 0 .8rem;display:flex;align-items:center;gap:8px;">
-                    <span style="animation:pulse 1.5s ease infinite;display:inline-block;">⚡</span>
-                    Processando...
-                </div>""",
-                unsafe_allow_html=True,
-            )
+            col1, col2 = st.columns(2, gap="medium")
 
-            barra         = st.progress(0, text="Iniciando...")
-            slot_status   = st.empty()
-            slot_metricas = st.empty()
-            slot_parar    = st.empty()
-            slot_log      = st.empty()
-
-            import time as _time
-            _t0    = _time.time()
-            _state = {"ok": 0, "erro": 0, "aviso": 0, "log": [], "last_log": "", "pct_last": -1, "cb_count": 0}
-            st.session_state["parar_busca"] = False
-
-            _COR = {
-                "ok":        ("#065f46", "#059669", "#ecfdf5"),
-                "erro":      ("#991b1b", "#dc2626", "#fef2f2"),
-                "aviso":     ("#92400e", "#d97706", "#fffbeb"),
-                "info":      ("#1e40af", "#3b82f6", "#eff6ff"),
-                "pdf_salvo": ("#065f46", "#059669", "#ecfdf5"),
-            }
-            _ICONE = {"ok":"✅","erro":"❌","aviso":"⚠️","info":"🔍","pdf_salvo":"📄"}
-            _ETAPAS_SYS = {"Planilha lida","Concluído","Pasta localizada",
-                           "Agrupamento concluído","Retomando execução"}
-
-            def cb(prog: float, etapa: str, detalhe: str = "", status: str = "info"):
-                if st.session_state.get("parar_busca"):
-                    return
-                pct     = int(prog * 100)
-                elapsed = _time.time() - _t0
-                barra.progress(min(prog, 1.0), text=f"{pct}%")
-
-                fg, accent, bg = _COR.get(status, _COR["info"])
-                icone = _ICONE.get(status, "🔍")
-                det_h = (f'<div style="font-size:11px;color:{accent};margin-top:3px;">'
-                         f'{detalhe}</div>') if detalhe else ""
-                slot_status.markdown(
-                    f'<div style="background:{bg};border-left:3px solid {accent};'
-                    f'border-radius:0 10px 10px 0;padding:10px 16px;margin:4px 0;">'
-                    f'<span style="font-weight:600;color:{fg};">{icone} {etapa}</span>{det_h}</div>',
-                    unsafe_allow_html=True,
+            # ── Coluna esquerda ──────────────────────────────
+            with col1:
+                st.markdown("##### 📄 Planilha de pacientes")
+                arquivo_excel = st.file_uploader(
+                    "Arraste ou clique para enviar",
+                    type=["xlsx", "xls"],
+                    help="Colunas detectadas automaticamente.",
+                    label_visibility="collapsed",
                 )
 
-                if status in ("ok","pdf_salvo") and etapa not in _ETAPAS_SYS:
-                    _state["ok"] += 1
-                elif status == "erro":   _state["erro"] += 1
-                elif status == "aviso":  _state["aviso"] += 1
-
-                mins, secs = divmod(int(elapsed), 60)
-                tempo_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
-                slot_metricas.markdown(
-                    f'<div style="display:flex;gap:20px;padding:8px 0;font-family:\'Sora\',sans-serif;">'
-                    f'<span style="font-size:13px;"><span style="color:#059669;font-weight:700;">{_state["ok"]}</span>'
-                    f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">encontrados</span></span>'
-                    f'<span style="font-size:13px;"><span style="color:#dc2626;font-weight:700;">{_state["erro"]}</span>'
-                    f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">erros</span></span>'
-                    f'<span style="font-size:13px;"><span style="color:#d97706;font-weight:700;">{_state["aviso"]}</span>'
-                    f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">não localizados</span></span>'
-                    f'<span style="font-size:13px;color:#374151;font-weight:600;">⏱ {tempo_str}</span>'
-                    f'</div>',
-                    unsafe_allow_html=True,
-                )
-
-                with slot_parar:
-                    _state["cb_count"] += 1
-                    _btn_key = f"parar_{_state['cb_count']}"
-                    if st.button("⏹  Parar busca", key=_btn_key, use_container_width=False):
-                        st.session_state["parar_busca"] = True
-
-                linha = f"{icone} {etapa}" + (f"  —  {detalhe}" if detalhe else "")
-                if linha != _state["last_log"]:
-                    _state["log"].append(linha)
-                    _state["last_log"] = linha
-                slot_log.code("\n".join(_state["log"][-25:]), language=None)
-
-            try:
-                resultados = processar_lista(
-                    caminho_excel   = caminho_tmp,
-                    drive_raiz      = drive_raiz.strip(),
-                    pasta_destino   = pasta_destino.strip(),
-                    threshold_fuzzy = threshold,
-                    callback        = cb,
-                    modo_extracao   = modo_extracao,
-                    dpi_ocr         = dpi_ocr,
-                    filtrar_aso     = filtrar_aso,
-                    max_workers     = max_workers,
-                    varredura_total = varredura_total,
-                )
-            except Exception as e:
-                st.error(f"❌ Erro crítico: {e}")
-                os.unlink(caminho_tmp)
-                st.stop()
-
-            os.unlink(caminho_tmp)
-
-            total       = len(resultados)
-            encontrados = sum(1 for r in resultados if r["encontrado"])
-            for r in resultados:
-                salvar_resultado(execucao_id, r)
-            finalizar_execucao(execucao_id, total, encontrados)
-
-            barra.progress(1.0, text="100% — Concluído!")
-            slot_status.empty()
-            slot_parar.empty()
-
-            # Notificação sonora
-            st.markdown(
-                """<script>
-                try {
-                    const a = new AudioContext(), o = a.createOscillator(), g = a.createGain();
-                    o.connect(g); g.connect(a.destination);
-                    o.frequency.setValueAtTime(880, a.currentTime);
-                    o.frequency.setValueAtTime(1100, a.currentTime + 0.12);
-                    g.gain.setValueAtTime(0.12, a.currentTime);
-                    g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + 0.45);
-                    o.start(); o.stop(a.currentTime + 0.45);
-                } catch(e) {}
-                </script>""",
-                unsafe_allow_html=True,
-            )
-
-            # E-mails automáticos
-            if enviar_email_auto and email_configurado():
-                with st.spinner("Enviando e-mails..."):
-                    enviados = 0
-                    for r in resultados:
-                        if r["encontrado"] and r.get("email"):
-                            ok_m, _ = enviar_email(
-                                destinatario=r["email"],
-                                assunto=f"Documento encontrado — {r['nome']}",
-                                corpo=(f"<p>Prezado(a), o documento de <strong>{r['nome']}</strong> "
-                                       f"referente a <strong>{r['data']}</strong> foi localizado.</p>"),
-                                caminho_pdf=r["arquivo"],
-                            )
-                            if ok_m: enviados += 1
-                    if email_relatorio:
-                        enviar_relatorio_execucao(
-                            email_relatorio, total, encontrados,
-                            total-encontrados, usuario.get("nome",""),
-                        )
-                st.success(f"📧 {enviados} e-mail(s) enviado(s).")
-
-            # ── Resultados ───────────────────────────────────
-            st.markdown("<div style='margin-top:1.5rem'></div>", unsafe_allow_html=True)
-            secao_titulo("📊", "Resultados", "Resumo do processamento")
-
-            nao_enc = total - encontrados
-            taxa    = round(encontrados / total * 100) if total > 0 else 0
-
-            _mc1, _mc2, _mc3, _mc4 = st.columns(4)
-            _mc1.metric("Total processados",   total)
-            _mc2.metric("✅ Encontrados",       encontrados)
-            _mc3.metric("❌ Não encontrados",   nao_enc)
-            _mc4.metric("🎯 Taxa de sucesso",   f"{taxa}%")
-
-            st.markdown("<div style='margin-top:.8rem'></div>", unsafe_allow_html=True)
-
-            # Botões de ação
-            _ba1, _ba2, _ba3 = st.columns(3)
-            with _ba1:
-                if st.button("📂  Abrir pasta de destino", use_container_width=True):
+                if arquivo_excel:
                     try:
-                        _p = Path(pasta_destino.strip())
-                        if platform.system() == "Windows": os.startfile(str(_p))
-                        elif platform.system() == "Darwin": subprocess.run(["open", str(_p)])
-                        else: subprocess.run(["xdg-open", str(_p)])
-                    except Exception as _e:
-                        st.error(f"Não foi possível abrir: {_e}")
+                        import tempfile as _tf
+                        with _tf.NamedTemporaryFile(delete=False, suffix=".xlsx") as _t:
+                            _t.write(arquivo_excel.read()); _tp = _t.name
+                        arquivo_excel.seek(0)
+                        _regs   = ler_planilha(_tp); os.unlink(_tp)
+                        _avisos = validar_planilha(_regs)
 
-            df = pd.DataFrame(resultados).rename(columns={
-                "nome":"Nome","data":"Data","email":"E-mail","encontrado":"Encontrado",
-                "arquivo":"Arquivo gerado","erro":"Observação","score_fuzzy":"Score",
-            })
+                        st.success(f"✓ **{len(_regs)} registros detectados**")
 
-            with _ba2:
+                        for _av in _avisos[:3]:
+                            st.warning(f"⚠ {_av['msg']}")
+
+                        with st.expander("👁️ Prévia da planilha", expanded=True):
+                            _prev_df = pd.DataFrame([
+                                {
+                                    "Nome":   r.get("nome", ""),
+                                    "Data":   str(r.get("data", "")),
+                                    "E-mail": r.get("email", "") or "—",
+                                }
+                                for r in _regs
+                            ])
+                            st.dataframe(
+                                _prev_df,
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(36 * len(_prev_df) + 38, 320),
+                            )
+                            st.caption(f"Exibindo {len(_regs)} registros")
+
+                    except Exception as _ex:
+                        st.error(f"❌ Erro ao ler planilha: {_ex}")
+
+                st.markdown("<div style='margin-top:14px'></div>", unsafe_allow_html=True)
+                st.markdown("##### 📁 Caminhos")
+
+                _c1, _c2 = st.columns([6, 1])
+                with _c1:
+                    drive_raiz = st.text_input(
+                        "Pasta raiz do drive",
+                        placeholder="Ex: Z:\\Procedimentos",
+                        key="input_drive_raiz",
+                    )
+                with _c2:
+                    st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+                    st.button("🗂️", key="btn_drive", help="Selecionar pelo explorador", on_click=_cb_drive)
+
+                _c3, _c4 = st.columns([6, 1])
+                with _c3:
+                    pasta_destino = st.text_input(
+                        "Pasta de destino",
+                        placeholder="Ex: C:\\Resultados",
+                        key="input_pasta_destino",
+                    )
+                with _c4:
+                    st.markdown("<div style='margin-top:28px'></div>", unsafe_allow_html=True)
+                    st.button("🗂️", key="btn_destino", help="Selecionar pelo explorador", on_click=_cb_destino)
+
+            # ── Coluna direita ───────────────────────────────
+            with col2:
+                st.markdown("##### ⚙️ Configurações da busca")
+
+                threshold = st.slider(
+                    "🎯 Sensibilidade fuzzy",
+                    min_value=60, max_value=100,
+                    value=cfg.get("threshold_fuzzy", 80), step=5,
+                    help="100 = exato  |  80 = tolera erros de OCR  |  60 = permissivo",
+                )
+
+                _MODOS = {
+                    "auto":   "🔄 Automático — detecta tipo do PDF",
+                    "nativo": "⚡ Só texto nativo — PDFs digitais (rápido)",
+                    "ocr":    "🔍 Só OCR — PDFs escaneados (lento)",
+                }
+                modo_extracao = st.radio(
+                    "📄 Modo de extração",
+                    options=list(_MODOS.keys()),
+                    format_func=lambda k: _MODOS[k],
+                    index=list(_MODOS.keys()).index(cfg.get("modo_extracao", "auto")),
+                )
+
+                _cDPI, _cWRK = st.columns(2)
+                with _cDPI:
+                    dpi_ocr = st.select_slider(
+                        "🖼️ Qualidade OCR",
+                        options=[150, 200, 300],
+                        value=cfg.get("dpi_ocr", 150),
+                        format_func=lambda v: {150:"⚡ 150 DPI", 200:"⚖️ 200 DPI", 300:"🔬 300 DPI"}[v],
+                        disabled=(modo_extracao == "nativo"),
+                    )
+                with _cWRK:
+                    max_workers = st.slider(
+                        "🧵 Threads",
+                        min_value=1, max_value=8,
+                        value=cfg.get("max_workers", 4),
+                        help="PDFs processados em paralelo.",
+                    )
+
+                st.markdown("<div style='margin-top:4px'></div>", unsafe_allow_html=True)
+                _cASO, _cMAIL = st.columns(2)
+                with _cASO:
+                    filtrar_aso = st.checkbox(
+                        "🏥 Apenas ASO",
+                        value=cfg.get("filtrar_aso", False),
+                        help="Ignora páginas que não sejam Atestado de Saúde Ocupacional.",
+                    )
+                with _cMAIL:
+                    enviar_email_auto = st.checkbox(
+                        "📧 E-mail automático",
+                        value=cfg.get("enviar_email_auto", False),
+                    )
+
+                varredura_total = st.checkbox(
+                    "🔎 Varredura total",
+                    value=cfg.get("varredura_total", False),
+                    help="Ignora as datas e varre todos os PDFs recursivamente.",
+                )
+                if varredura_total:
+                    st.warning("⚠️ **Varredura total ativada** — pode levar vários minutos.")
+
+                email_relatorio = ""
+                if enviar_email_auto:
+                    email_relatorio = st.text_input(
+                        "E-mail para relatório",
+                        value=cfg.get("email_relatorio", ""),
+                        placeholder="gestor@clinica.com.br",
+                    )
+
+            st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+            iniciar = st.button("▶  Iniciar busca em lote", type="primary", use_container_width=True)
+
+            # ── Processamento ────────────────────────────────
+            if iniciar:
+                erros = []
+                if not arquivo_excel:         erros.append("Faça upload da planilha Excel.")
+                if not drive_raiz.strip():    erros.append("Informe o caminho do drive.")
+                if not pasta_destino.strip(): erros.append("Informe a pasta de destino.")
+                if erros:
+                    for e in erros: st.error(f"❌ {e}")
+                    st.stop()
+
+                cfg.update({
+                    "drive_raiz": drive_raiz.strip(), "pasta_destino": pasta_destino.strip(),
+                    "threshold_fuzzy": threshold, "filtrar_aso": filtrar_aso,
+                    "enviar_email_auto": enviar_email_auto, "email_relatorio": email_relatorio,
+                    "modo_extracao": modo_extracao, "dpi_ocr": dpi_ocr, "max_workers": max_workers, "varredura_total": varredura_total,
+                })
+                salvar_config(cfg)
+
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+                    tmp.write(arquivo_excel.read())
+                    caminho_tmp = tmp.name
+
+                execucao_id = iniciar_execucao(usuario.get("id"), drive_raiz.strip(), pasta_destino.strip())
+
+                st.markdown(
+                    """<div style="font-size:14px;font-weight:600;color:#111827;
+                        margin:1rem 0 .8rem;display:flex;align-items:center;gap:8px;">
+                        <span style="animation:pulse 1.5s ease infinite;display:inline-block;">⚡</span>
+                        Processando...
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+
+                barra         = st.progress(0, text="Iniciando...")
+                slot_status   = st.empty()
+                slot_metricas = st.empty()
+                slot_parar    = st.empty()
+                slot_log      = st.empty()
+
+                import time as _time
+                _t0    = _time.time()
+                _state = {"ok": 0, "erro": 0, "aviso": 0, "log": [], "last_log": "", "pct_last": -1, "cb_count": 0}
+                st.session_state["parar_busca"] = False
+
+                _COR = {
+                    "ok":        ("#065f46", "#059669", "#ecfdf5"),
+                    "erro":      ("#991b1b", "#dc2626", "#fef2f2"),
+                    "aviso":     ("#92400e", "#d97706", "#fffbeb"),
+                    "info":      ("#1e40af", "#3b82f6", "#eff6ff"),
+                    "pdf_salvo": ("#065f46", "#059669", "#ecfdf5"),
+                }
+                _ICONE = {"ok":"✅","erro":"❌","aviso":"⚠️","info":"🔍","pdf_salvo":"📄"}
+                _ETAPAS_SYS = {"Planilha lida","Concluído","Pasta localizada",
+                               "Agrupamento concluído","Retomando execução"}
+
+                def cb(prog: float, etapa: str, detalhe: str = "", status: str = "info"):
+                    if st.session_state.get("parar_busca"):
+                        return
+                    pct     = int(prog * 100)
+                    elapsed = _time.time() - _t0
+                    barra.progress(min(prog, 1.0), text=f"{pct}%")
+
+                    fg, accent, bg = _COR.get(status, _COR["info"])
+                    icone = _ICONE.get(status, "🔍")
+                    det_h = (f'<div style="font-size:11px;color:{accent};margin-top:3px;">'
+                             f'{detalhe}</div>') if detalhe else ""
+                    slot_status.markdown(
+                        f'<div style="background:{bg};border-left:3px solid {accent};'
+                        f'border-radius:0 10px 10px 0;padding:10px 16px;margin:4px 0;">'
+                        f'<span style="font-weight:600;color:{fg};">{icone} {etapa}</span>{det_h}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    if status in ("ok","pdf_salvo") and etapa not in _ETAPAS_SYS:
+                        _state["ok"] += 1
+                    elif status == "erro":   _state["erro"] += 1
+                    elif status == "aviso":  _state["aviso"] += 1
+
+                    mins, secs = divmod(int(elapsed), 60)
+                    tempo_str = f"{mins}m {secs:02d}s" if mins else f"{secs}s"
+                    slot_metricas.markdown(
+                        f'<div style="display:flex;gap:20px;padding:8px 0;font-family:\'Sora\',sans-serif;">'
+                        f'<span style="font-size:13px;"><span style="color:#059669;font-weight:700;">{_state["ok"]}</span>'
+                        f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">encontrados</span></span>'
+                        f'<span style="font-size:13px;"><span style="color:#dc2626;font-weight:700;">{_state["erro"]}</span>'
+                        f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">erros</span></span>'
+                        f'<span style="font-size:13px;"><span style="color:#d97706;font-weight:700;">{_state["aviso"]}</span>'
+                        f'<span style="color:#6b7280;font-size:11px;margin-left:3px;">não localizados</span></span>'
+                        f'<span style="font-size:13px;color:#374151;font-weight:600;">⏱ {tempo_str}</span>'
+                        f'</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    with slot_parar:
+                        _state["cb_count"] += 1
+                        _btn_key = f"parar_{_state['cb_count']}"
+                        if st.button("⏹  Parar busca", key=_btn_key, use_container_width=False):
+                            st.session_state["parar_busca"] = True
+
+                    linha = f"{icone} {etapa}" + (f"  —  {detalhe}" if detalhe else "")
+                    if linha != _state["last_log"]:
+                        _state["log"].append(linha)
+                        _state["last_log"] = linha
+                    slot_log.code("\n".join(_state["log"][-25:]), language=None)
+
                 try:
-                    import io as _io
-                    import openpyxl as _xl
-                    from openpyxl.styles import PatternFill, Font, Alignment
-                    _wb = _xl.Workbook(); _ws = _wb.active; _ws.title = "Resultados"
-                    _cabs = ["Nome","Data","E-mail","Encontrado","Score","Arquivo","Observação"]
-                    for _ci, _cab in enumerate(_cabs, 1):
-                        _cell = _ws.cell(row=1, column=_ci, value=_cab)
-                        _cell.fill = PatternFill("solid", fgColor="0D1F2D")
-                        _cell.font = Font(color="1D9E75", bold=True, size=11)
-                        _cell.alignment = Alignment(horizontal="center")
-                    _fv  = PatternFill("solid", fgColor="E1F5EE")
-                    _fv2 = PatternFill("solid", fgColor="FCEBEB")
-                    for _ri, _r in enumerate(resultados, 2):
-                        _vals = [_r.get("nome",""), _r.get("data",""), _r.get("email",""),
-                                 "Sim" if _r.get("encontrado") else "Não",
-                                 f"{_r.get('score_fuzzy',0):.0f}%",
-                                 _r.get("arquivo",""), _r.get("erro","")]
-                        _fi = _fv if _r.get("encontrado") else _fv2
-                        for _ci, _v in enumerate(_vals, 1):
-                            _c2 = _ws.cell(row=_ri, column=_ci, value=_v)
-                            _c2.fill = _fi
-                    for _col in _ws.columns:
-                        _ws.column_dimensions[_col[0].column_letter].width = min(
-                            max(len(str(_c.value or "")) for _c in _col)+4, 50)
-                    _buf = _io.BytesIO(); _wb.save(_buf)
+                    resultados = processar_lista(
+                        caminho_excel   = caminho_tmp,
+                        drive_raiz      = drive_raiz.strip(),
+                        pasta_destino   = pasta_destino.strip(),
+                        threshold_fuzzy = threshold,
+                        callback        = cb,
+                        modo_extracao   = modo_extracao,
+                        dpi_ocr         = dpi_ocr,
+                        filtrar_aso     = filtrar_aso,
+                        max_workers     = max_workers,
+                        varredura_total = varredura_total,
+                    )
+                except Exception as e:
+                    st.error(f"❌ Erro crítico: {e}")
+                    os.unlink(caminho_tmp)
+                    st.stop()
+
+                os.unlink(caminho_tmp)
+
+                total       = len(resultados)
+                encontrados = sum(1 for r in resultados if r["encontrado"])
+                for r in resultados:
+                    salvar_resultado(execucao_id, r)
+                finalizar_execucao(execucao_id, total, encontrados)
+
+                barra.progress(1.0, text="100% — Concluído!")
+                slot_status.empty()
+                slot_parar.empty()
+
+                # Notificação sonora
+                st.markdown(
+                    """<script>
+                    try {
+                        const a = new AudioContext(), o = a.createOscillator(), g = a.createGain();
+                        o.connect(g); g.connect(a.destination);
+                        o.frequency.setValueAtTime(880, a.currentTime);
+                        o.frequency.setValueAtTime(1100, a.currentTime + 0.12);
+                        g.gain.setValueAtTime(0.12, a.currentTime);
+                        g.gain.exponentialRampToValueAtTime(0.001, a.currentTime + 0.45);
+                        o.start(); o.stop(a.currentTime + 0.45);
+                    } catch(e) {}
+                    </script>""",
+                    unsafe_allow_html=True,
+                )
+
+                # E-mails automáticos
+                if enviar_email_auto and email_configurado():
+                    with st.spinner("Enviando e-mails..."):
+                        enviados = 0
+                        for r in resultados:
+                            if r["encontrado"] and r.get("email"):
+                                ok_m, _ = enviar_email(
+                                    destinatario=r["email"],
+                                    assunto=f"Documento encontrado — {r['nome']}",
+                                    corpo=(f"<p>Prezado(a), o documento de <strong>{r['nome']}</strong> "
+                                           f"referente a <strong>{r['data']}</strong> foi localizado.</p>"),
+                                    caminho_pdf=r["arquivo"],
+                                )
+                                if ok_m: enviados += 1
+                        if email_relatorio:
+                            enviar_relatorio_execucao(
+                                email_relatorio, total, encontrados,
+                                total-encontrados, usuario.get("nome",""),
+                            )
+                    st.success(f"📧 {enviados} e-mail(s) enviado(s).")
+
+                # ── Resultados ───────────────────────────────
+                st.markdown("<div style='margin-top:1.5rem'></div>", unsafe_allow_html=True)
+                secao_titulo("📊", "Resultados", "Resumo do processamento")
+
+                nao_enc = total - encontrados
+                taxa    = round(encontrados / total * 100) if total > 0 else 0
+
+                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+                _mc1.metric("Total processados",   total)
+                _mc2.metric("✅ Encontrados",       encontrados)
+                _mc3.metric("❌ Não encontrados",   nao_enc)
+                _mc4.metric("🎯 Taxa de sucesso",   f"{taxa}%")
+
+                st.markdown("<div style='margin-top:.8rem'></div>", unsafe_allow_html=True)
+
+                _ba1, _ba2, _ba3 = st.columns(3)
+                with _ba1:
+                    if st.button("📂  Abrir pasta de destino", use_container_width=True):
+                        try:
+                            _p = Path(pasta_destino.strip())
+                            if platform.system() == "Windows": os.startfile(str(_p))
+                            elif platform.system() == "Darwin": subprocess.run(["open", str(_p)])
+                            else: subprocess.run(["xdg-open", str(_p)])
+                        except Exception as _e:
+                            st.error(f"Não foi possível abrir: {_e}")
+
+                df = pd.DataFrame(resultados).rename(columns={
+                    "nome":"Nome","data":"Data","email":"E-mail","encontrado":"Encontrado",
+                    "arquivo":"Arquivo gerado","erro":"Observação","score_fuzzy":"Score",
+                })
+
+                with _ba2:
+                    try:
+                        import io as _io
+                        import openpyxl as _xl
+                        from openpyxl.styles import PatternFill, Font, Alignment
+                        _wb = _xl.Workbook(); _ws = _wb.active; _ws.title = "Resultados"
+                        _cabs = ["Nome","Data","E-mail","Encontrado","Score","Arquivo","Observação"]
+                        for _ci, _cab in enumerate(_cabs, 1):
+                            _cell = _ws.cell(row=1, column=_ci, value=_cab)
+                            _cell.fill = PatternFill("solid", fgColor="0D1F2D")
+                            _cell.font = Font(color="1D9E75", bold=True, size=11)
+                            _cell.alignment = Alignment(horizontal="center")
+                        _fv  = PatternFill("solid", fgColor="E1F5EE")
+                        _fv2 = PatternFill("solid", fgColor="FCEBEB")
+                        for _ri, _r in enumerate(resultados, 2):
+                            _vals = [_r.get("nome",""), _r.get("data",""), _r.get("email",""),
+                                     "Sim" if _r.get("encontrado") else "Não",
+                                     f"{_r.get('score_fuzzy',0):.0f}%",
+                                     _r.get("arquivo",""), _r.get("erro","")]
+                            _fi = _fv if _r.get("encontrado") else _fv2
+                            for _ci, _v in enumerate(_vals, 1):
+                                _c2 = _ws.cell(row=_ri, column=_ci, value=_v)
+                                _c2.fill = _fi
+                        for _col in _ws.columns:
+                            _ws.column_dimensions[_col[0].column_letter].width = min(
+                                max(len(str(_c.value or "")) for _c in _col)+4, 50)
+                        _buf = _io.BytesIO(); _wb.save(_buf)
+                        st.download_button(
+                            "⬇️  Baixar Excel (.xlsx)",
+                            data=_buf.getvalue(),
+                            file_name=f"ifind_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                        )
+                    except Exception:
+                        st.info("openpyxl não disponível para Excel.")
+
+                with _ba3:
+                    _csv = df.to_csv(index=False).encode("utf-8-sig")
                     st.download_button(
-                        "⬇️  Baixar Excel (.xlsx)",
-                        data=_buf.getvalue(),
-                        file_name=f"ifind_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        "⬇️  Baixar CSV",
+                        _csv,
+                        f"ifind_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                        "text/csv",
                         use_container_width=True,
                     )
-                except Exception:
-                    st.info("openpyxl não disponível para Excel.")
 
-            with _ba3:
-                _csv = df.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    "⬇️  Baixar CSV",
-                    _csv,
-                    f"ifind_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    "text/csv",
-                    use_container_width=True,
-                )
-
-            # Tabela de resultados customizada
-            st.markdown("<div style='margin-top:.8rem'></div>", unsafe_allow_html=True)
-            _linhas = ""
-            for _r in resultados:
-                _enc  = _r.get("encontrado", False)
-                _sc   = _r.get("score_fuzzy", 0)
-                _obs  = _r.get("erro", "")
-                if _enc:
-                    _st_h  = badge("✓ Encontrado", "verde")
-                    _sc_h  = f'<span style="color:#059669;font-weight:700;font-size:13px;">{_sc:.0f}%</span>'
-                elif "ASO" in _obs:
-                    _st_h  = badge("⊘ Não é ASO", "amarelo")
-                    _sc_h  = '<span style="color:#9ca3af;">—</span>'
-                else:
-                    _st_h  = badge("✗ Não encontrado", "vermelho")
-                    _sc_h  = '<span style="color:#9ca3af;">—</span>'
-                _obs_t = (_obs[:55]+"…") if len(_obs) > 55 else _obs
-                _linhas += (
-                    f'<tr style="border-bottom:1px solid #f3f4f6;">'
-                    f'<td style="padding:10px 14px;color:#111827;font-weight:500;font-size:13px;">{_r.get("nome","")}</td>'
-                    f'<td style="padding:10px 14px;color:#6b7280;font-size:12px;">{_r.get("data","")}</td>'
-                    f'<td style="padding:10px 14px;">{_st_h}</td>'
-                    f'<td style="padding:10px 14px;">{_sc_h}</td>'
-                    f'<td style="padding:10px 14px;color:#9ca3af;font-size:11px;'
-                    f'font-family:\'JetBrains Mono\',monospace;">{_obs_t}</td>'
-                    f'</tr>'
-                )
-            tabela_custom(_linhas, ["Nome","Data","Status","Score","Observação"])
-
-            if nao_enc > 0:
                 st.markdown("<div style='margin-top:.8rem'></div>", unsafe_allow_html=True)
-                st.warning(f"⚠️ {nao_enc} registro(s) não encontrado(s). Verifique a coluna Observação.")
+                _linhas = ""
+                for _r in resultados:
+                    _enc  = _r.get("encontrado", False)
+                    _sc   = _r.get("score_fuzzy", 0)
+                    _obs  = _r.get("erro", "")
+                    if _enc:
+                        _st_h  = badge("✓ Encontrado", "verde")
+                        _sc_h  = f'<span style="color:#059669;font-weight:700;font-size:13px;">{_sc:.0f}%</span>'
+                    elif "ASO" in _obs:
+                        _st_h  = badge("⊘ Não é ASO", "amarelo")
+                        _sc_h  = '<span style="color:#9ca3af;">—</span>'
+                    else:
+                        _st_h  = badge("✗ Não encontrado", "vermelho")
+                        _sc_h  = '<span style="color:#9ca3af;">—</span>'
+                    _obs_t = (_obs[:55]+"…") if len(_obs) > 55 else _obs
+                    _linhas += (
+                        f'<tr style="border-bottom:1px solid #f3f4f6;">'
+                        f'<td style="padding:10px 14px;color:#111827;font-weight:500;font-size:13px;">{_r.get("nome","")}</td>'
+                        f'<td style="padding:10px 14px;color:#6b7280;font-size:12px;">{_r.get("data","")}</td>'
+                        f'<td style="padding:10px 14px;">{_st_h}</td>'
+                        f'<td style="padding:10px 14px;">{_sc_h}</td>'
+                        f'<td style="padding:10px 14px;color:#9ca3af;font-size:11px;'
+                        f'font-family:\'JetBrains Mono\',monospace;">{_obs_t}</td>'
+                        f'</tr>'
+                    )
+                tabela_custom(_linhas, ["Nome","Data","Status","Score","Observação"])
 
-    # ════════════════════════════════════════════════════════
+                if nao_enc > 0:
+                    st.markdown("<div style='margin-top:.8rem'></div>", unsafe_allow_html=True)
+                    st.warning(f"⚠️ {nao_enc} registro(s) não encontrado(s). Verifique a coluna Observação.")
+
+
+        # ════════════════════════════════════════════════════════
     #  ABA 2 — HISTÓRICO
     # ════════════════════════════════════════════════════════
     with aba_historico:

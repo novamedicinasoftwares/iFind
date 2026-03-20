@@ -29,7 +29,9 @@ ICO_FILE      = PASTA / "ifind.ico"
 
 PACKAGES = [
     "streamlit>=1.32.0", "PyMuPDF>=1.23.0", "Pillow>=10.0.0",
-    "pytesseract>=0.3.10", "openpyxl>=3.1.0", "pandas>=2.0.0",
+    "pytesseract>=0.3.10", "openpyxl>=3.1.0",
+    "numpy>=1.26.0",      # instalado antes do pandas — evita incompatibilidade Python 3.13
+    "pandas>=2.2.0",
     "rapidfuzz>=3.6.0", "plotly>=5.18.0", "pywebview>=4.4.0",
 ]
 
@@ -440,7 +442,7 @@ def init(sp):
         sp.status("Verificando dependencias...")
         sp.prog(0.22)
         chk = subprocess.run(
-            [py, "-c", "import streamlit, fitz, rapidfuzz"],
+            [py, "-c", "import streamlit, fitz, rapidfuzz, numpy, pandas"],
             capture_output=True
         )
 
@@ -450,10 +452,12 @@ def init(sp):
                 nm = pkg.split(">=")[0].split("==")[0]
                 sp.status(f"Instalando ({i+1}/{len(PACKAGES)}): {nm}...")
                 sp.log(f"  {nm}...", CA)
+                # Numpy e pandas precisam de mais tempo no Python 3.13
+                _extra = ["--upgrade"] if "numpy" in pkg or "pandas" in pkg else []
                 r = subprocess.run(
                     [py, "-m", "pip", "install", "--quiet",
-                     "--disable-pip-version-check", pkg],
-                    capture_output=True, text=True, timeout=300
+                     "--disable-pip-version-check"] + _extra + [pkg],
+                    capture_output=True, text=True, timeout=600
                 )
                 sp.prog(0.22 + (i + 1) / len(PACKAGES) * 0.32)
                 if r.returncode != 0:
@@ -605,7 +609,7 @@ def main():
     os.chdir(str(PASTA))
     sp = Splash()
     sp.bg(lambda: init(sp))
-    sp.loop()  # mainloop roda aqui — nunca sai antes do webview fechar
+    sp.loop() 
 
 
 if __name__ == "__main__":
